@@ -161,6 +161,75 @@ def realise_filtration_direction(t, sigma, m, direction, k):
     return new_t, new_sigma, move_type
 
 
+@torch.no_grad()
+def select_filtration_direction(t, sigma, phi, gamma, k):
+    """Select the best positive provisional direction, Algorithm 1.
+
+    phi and gamma have shape [k, z] for one graph and one view.
+    gamma is the NEGATIVE classification-loss gradient.
+
+    Return (rank, direction, score), or None if no positive candidate.
+    This function does not modify t or realise the selected direction.
+    """
+    expected_sigma = validate_current_filtration(t, k)
+
+    if not isinstance(sigma, torch.Tensor):
+        raise TypeError("sigma must be a torch.Tensor.")
+    if sigma.dtype != torch.long or sigma.device != t.device:
+        raise ValueError("sigma must be long and on the same device as t.")
+    if not torch.equal(sigma, expected_sigma):
+        raise ValueError("sigma does not match t.")
+
+    if not isinstance(phi, torch.Tensor):
+        raise TypeError("phi must be a torch.Tensor.")
+    if not isinstance(gamma, torch.Tensor):
+        raise TypeError("gamma must be a torch.Tensor.")
+    if phi.ndim != 2 or phi.shape[0] != k or phi.shape[1] == 0:
+        raise ValueError("phi must have shape [k, z] with z > 0.")
+    if gamma.shape != phi.shape:
+        raise ValueError("gamma and phi must have the same shape.")
+    if not phi.is_floating_point() or not gamma.is_floating_point():
+        raise TypeError("phi and gamma must be floating-point tensors.")
+    if phi.device != gamma.device or phi.dtype != gamma.dtype:
+        raise ValueError("phi and gamma must share device and dtype.")
+    if not torch.isfinite(phi).all().item():
+        raise ValueError("phi must contain finite values.")
+    if not torch.isfinite(gamma).all().item():
+        raise ValueError("gamma must contain finite values.")
+
+    best = None
+    best_score = 0.0
+
+    # Increasing rank, with decrement considered first, resolves ties.
+    for m in range(1, t.numel()):
+        vertex = int(sigma[m].item())
+        s = int(t[vertex].item())
+
+        # Algorithm 1, lines 7-9: admissible provisional decrement.
+        if m >= 2 or s > 2:
+            delta = torch.dot(
+                gamma[s - 2],
+                phi[s - 1] - phi[s - 2],
+            ).item()
+
+            if delta > best_score:
+                best_score = delta
+                best = (m, "-", delta)
+
+        # Algorithm 1, lines 11-13: admissible provisional increment.
+        if s < k:
+            delta = torch.dot(
+                gamma[s - 1],
+                phi[s - 2] - phi[s - 1],
+            ).item()
+
+            if delta > best_score:
+                best_score = delta
+                best = (m, "+", delta)
+
+    return best
+
+
 class DeepSetLayer(nn.Module):
     """Simple equivariant deep set layer."""
 
