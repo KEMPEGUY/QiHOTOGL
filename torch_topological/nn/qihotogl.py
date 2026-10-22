@@ -4,13 +4,21 @@ Implemented helpers:
     - validation of anchored, injective integer filtrations with gaps
     - Algorithm 1 unit-step candidate scoring and selection
     - Algorithm 2 unit-step direct-move and adjacent-swap realisation
+    - filtered clique complexes and oriented boundary matrices
+    - exact-reference Hodge moments for selectable simplex dimensions
 
-The QiHOTOGL class currently retains the inherited TOGL forward
-computation based on persistence pairs, DeepSets and a node residual.
-The helpers are not yet connected to its training pipeline.
+Filtration moves currently use epsilon = 1.
+General epsilon-perturbations are not yet implemented.
 
-Next mathematical component:
-    Hodge moment matrices, following the manuscript's definitions.
+Exact-reference moments use H_q = I - Delta_q / n_r, with n_r the
+active vertex count. Empty q-chain spaces have zero moment rows.
+Calculations use dense CPU float64 tensors for small reference graphs.
+
+The QiHOTOGL class still retains the inherited TOGL forward computation.
+The new helpers are not yet connected to its training pipeline.
+
+Next components:
+    Monte Carlo estimation, hard neural decoding, and backward integration.
 
 Original TOGL reference:
     https://github.com/BorgwardtLab/TOGL
