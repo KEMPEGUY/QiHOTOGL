@@ -3,7 +3,7 @@
 Implemented helpers:
     - validation of anchored, injective integer filtrations with gaps
     - Algorithm 1 unit-step candidate scoring and selection
-    - Algorithm 2 direct-move and adjacent-swap realisation
+    - Algorithm 2 unit-step direct-move and adjacent-swap realisation
 
 The QiHOTOGL class currently retains the inherited TOGL forward
 computation based on persistence pairs, DeepSets and a node residual.
@@ -80,6 +80,9 @@ def validate_current_filtration(t, k):
 
 def realise_filtration_direction(t, sigma, m, direction, k):
     """Realise one selected direction according to Algorithm 2.
+
+    Implements unit steps (epsilon = 1).
+    General epsilon-perturbations are not yet implemented.
 
     m is the current arrival rank, not an original vertex index.
     Return (new_t, new_sigma, move_type), without modifying inputs.
@@ -163,6 +166,7 @@ def select_filtration_direction(t, sigma, phi, gamma, k):
     """Select the best positive provisional direction, Algorithm 1.
 
     Implements unit steps (epsilon = 1) for one graph and one view.
+    General epsilon-perturbations are not yet implemented.
     phi and gamma have shape [k, z]; gamma is the NEGATIVE loss gradient.
     Moment columns for selected dimensions may be concatenated.
 
