@@ -234,6 +234,291 @@ def select_filtration_direction(t, sigma, phi, gamma, k):
     return best
 
 
+def filtered_clique_simplices(edge_index, t, level, max_dim):
+    """Build the induced clique complex at one filtration level.
+
+    Parameters
+    ----------
+    edge_index : integer tensor, shape [2, number_of_edges]
+        Edges of one graph, with vertices numbered 0, ..., n-1.
+        Reverse edges and duplicates are deduplicated.
+        Self-loops do not contribute simplices.
+    t : integer tensor, shape [n]
+        Positive vertex filtration levels, with minimum 1.
+        Ties are permitted for provisional scoring assignments.
+    level : int
+        Positive filtration threshold.
+    max_dim : int
+        Largest simplex dimension to construct.
+
+    Returns
+    -------
+    dict
+        Dimension -> sorted list of vertex tuples.
+        Original vertex labels are preserved. Ascending vertex tuples
+        provide the canonical orientation for boundary matrices.
+
+    Notes
+    -----
+    This CPU enumeration is an exact reference for small graphs.
+    It supplies no gradient through the discrete simplex construction.
+    """
+    from itertools import combinations
+
+    integer_dtypes = (
+        torch.int8, torch.int16, torch.int32,
+        torch.int64, torch.uint8,
+    )
+
+    # Validate assignments without requiring injectivity.
+    if not isinstance(t, torch.Tensor):
+        raise TypeError("t must be a torch.Tensor.")
+    if t.ndim != 1 or t.numel() == 0:
+        raise ValueError("t must be a nonempty vector.")
+    if t.dtype not in integer_dtypes:
+        raise TypeError("t must have an integer dtype.")
+    if t.min().item() != 1:
+        raise ValueError("The minimum filtration level must be 1.")
+
+    for name, value in (("level", level), ("max_dim", max_dim)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(name + " must be a Python integer.")
+
+    if level < 1:
+        raise ValueError("level must be positive.")
+    if max_dim < 0:
+        raise ValueError("max_dim must be nonnegative.")
+
+    # Validate graph connectivity.
+    if not isinstance(edge_index, torch.Tensor):
+        raise TypeError("edge_index must be a torch.Tensor.")
+    if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+        raise ValueError("edge_index must have shape [2, E].")
+    if edge_index.dtype not in integer_dtypes:
+        raise TypeError("edge_index must have an integer dtype.")
+
+    n = t.numel()
+    if edge_index.numel():
+        if edge_index.min().item() < 0:
+            raise ValueError("Vertex indices must be nonnegative.")
+        if edge_index.max().item() >= n:
+            raise ValueError("An edge references a vertex outside t.")
+
+    # Select active vertices, retaining original labels.
+    assignments = t.detach().cpu().tolist()
+    active = tuple(
+        vertex for vertex, value in enumerate(assignments)
+        if value <= level
+    )
+    active_set = set(active)
+
+    # Interpret connectivity as a simple undirected graph.
+    edges = set()
+    for u, v in edge_index.detach().cpu().t().tolist():
+        if u != v and u in active_set and v in active_set:
+            edges.add(tuple(sorted((u, v))))
+
+    simplices = {dimension: [] for dimension in range(max_dim + 1)}
+    simplices[0] = [(vertex,) for vertex in active]
+
+    if max_dim >= 1:
+        simplices[1] = sorted(edges)
+
+    # A higher simplex exists exactly when all its edges exist.
+    largest_possible_dim = min(max_dim, len(active) - 1)
+    for dimension in range(2, largest_possible_dim + 1):
+        simplices[dimension] = [
+            simplex
+            for simplex in combinations(active, dimension + 1)
+            if all(edge in edges for edge in combinations(simplex, 2))
+        ]
+
+    return simplices
+
+
+def oriented_boundary_matrix(simplices, q):
+    """Construct B_q: C_q -> C_(q-1) in canonical orientations.
+
+    simplices is the dictionary returned by filtered_clique_simplices.
+    Rows index (q-1)-simplices; columns index q-simplices.
+    B_0 has zero rows, following ordinary unreduced homology.
+
+    Returns a CPU float64 tensor for exact-reference calculations.
+    """
+    if isinstance(q, bool) or not isinstance(q, int):
+        raise TypeError("q must be a Python integer.")
+    if q < 0:
+        raise ValueError("q must be nonnegative.")
+    if q not in simplices:
+        raise ValueError("Requested simplex dimension was not constructed.")
+    if q > 0 and q - 1 not in simplices:
+        raise ValueError("Required face dimension was not constructed.")
+
+    upper = simplices[q]
+    lower = [] if q == 0 else simplices[q - 1]
+
+    # Check canonical simplex orientations and exclude duplicate entries.
+    for dimension, entries in ((q, upper), (q - 1, lower)):
+        if len(set(entries)) != len(entries):
+            raise ValueError("Simplex lists must not contain duplicates.")
+        for simplex in entries:
+            if len(simplex) != dimension + 1:
+                raise ValueError("Simplex has an incorrect dimension.")
+            if any(
+                simplex[i] >= simplex[i + 1]
+                for i in range(len(simplex) - 1)
+            ):
+                raise ValueError("Simplex vertices must be strictly increasing.")
+
+    boundary = torch.zeros(
+        (len(lower), len(upper)), dtype=torch.float64
+    )
+
+    # Vertices have zero boundary in ordinary homology.
+    if q == 0:
+        return boundary
+
+    row_index = {simplex: i for i, simplex in enumerate(lower)}
+
+    for column, simplex in enumerate(upper):
+        for position in range(q + 1):
+            face = simplex[:position] + simplex[position + 1:]
+
+            if face not in row_index:
+                raise ValueError("A simplex is missing a required face.")
+
+            boundary[row_index[face], column] = (
+                1.0 if position % 2 == 0 else -1.0
+            )
+
+    return boundary
+
+
+def exact_hodge_moments_at_level(edge_index, t, level, q, z_max):
+    """Compute exact-reference reflected moments at one level.
+
+    Uses H_q = I - Delta_q / n_r, where n_r counts active vertices.
+    Returns CPU float64 moments of orders 1, ..., z_max.
+
+    Empty q-chain spaces return zeros.
+    A nonempty zero-Laplacian space returns moments equal to one.
+    Provisional assignments with ties are supported.
+    """
+    for name, value in (("q", q), ("z_max", z_max)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(name + " must be a Python integer.")
+
+    if q < 0:
+        raise ValueError("q must be nonnegative.")
+    if z_max < 1:
+        raise ValueError("z_max must be positive.")
+
+    # Full q-Hodge Laplacians require simplices through dimension q+1.
+    simplices = filtered_clique_simplices(
+        edge_index, t, level, max_dim=q + 1
+    )
+
+    n_r = len(simplices[0])
+    d_q = len(simplices[q])
+
+    # The manuscript defines an empty q-chain-space row as zero.
+    if d_q == 0:
+        return torch.zeros(z_max, dtype=torch.float64)
+
+    B_q = oriented_boundary_matrix(simplices, q)
+    B_next = oriented_boundary_matrix(simplices, q + 1)
+
+    delta = B_q.T @ B_q + B_next @ B_next.T
+
+    # Anchoring guarantees at least one active vertex at levels >= 1.
+    identity = torch.eye(d_q, dtype=torch.float64)
+    reflected = identity - delta / n_r
+
+    # Repeated multiplication gives powers 1, ..., z_max.
+    power = identity
+    moments = torch.empty(z_max, dtype=torch.float64)
+
+    for index in range(z_max):
+        power = power @ reflected
+        moments[index] = torch.trace(power) / d_q
+
+    return moments
+
+
+def exact_hodge_moment_matrices(edge_index, t, k, q_values, z_max):
+    """Return exact-reference moment matrices for selected dimensions.
+
+    Processes one graph and one filtration view.
+    Returns {q: tensor of shape [k, z_max]} in the requested order.
+    Uses active-vertex normalization and CPU float64 calculations.
+    Ties are permitted in provisional assignments.
+
+    This reference implementation prioritizes clarity over performance.
+    """
+    if isinstance(k, bool) or not isinstance(k, int):
+        raise TypeError("k must be a Python integer.")
+    if k < 1:
+        raise ValueError("k must be positive.")
+
+    if isinstance(z_max, bool) or not isinstance(z_max, int):
+        raise TypeError("z_max must be a Python integer.")
+    if z_max < 1:
+        raise ValueError("z_max must be positive.")
+
+    q_values = tuple(q_values)
+    if not q_values:
+        raise ValueError("Select at least one simplex dimension.")
+    for q in q_values:
+        if isinstance(q, bool) or not isinstance(q, int):
+            raise TypeError("Each selected dimension must be a Python integer.")
+        if q < 0:
+            raise ValueError("Selected dimensions must be nonnegative.")
+    if len(set(q_values)) != len(q_values):
+        raise ValueError("Selected dimensions must not contain duplicates.")
+
+    if not isinstance(t, torch.Tensor):
+        raise TypeError("t must be a torch.Tensor.")
+    if t.ndim != 1 or t.numel() == 0:
+        raise ValueError("t must be a nonempty vector.")
+    if t.dtype not in (
+        torch.int8, torch.int16, torch.int32,
+        torch.int64, torch.uint8,
+    ):
+        raise TypeError("t must have an integer dtype.")
+    if k < t.numel():
+        raise ValueError("k must be at least the number of vertices.")
+    if t.min().item() != 1 or t.max().item() > k:
+        raise ValueError("Assignments must lie in [1, k] with minimum 1.")
+
+    matrices = {}
+    for q in q_values:
+        rows = []
+        previous_active = None
+        previous_row = None
+
+        for level in range(1, k + 1):
+            active = tuple(
+                torch.nonzero(t <= level, as_tuple=False)
+                .flatten().cpu().tolist()
+            )
+
+            # No new vertex means the entire induced complex is unchanged.
+            if active == previous_active:
+                row = previous_row
+            else:
+                row = exact_hodge_moments_at_level(
+                    edge_index, t, level, q, z_max
+                )
+
+            rows.append(row)
+            previous_active = active
+            previous_row = row
+
+        matrices[q] = torch.stack(rows)
+
+    return matrices
+
+
 class DeepSetLayer(nn.Module):
     """Simple equivariant deep set layer."""
 
