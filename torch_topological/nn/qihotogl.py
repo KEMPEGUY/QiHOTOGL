@@ -1,22 +1,19 @@
-"""Layers for topological data analysis based on graphs.
+"""QiHOTOGL development module adapted from the TOGL graph example.
 
-This is a work-in-progress module. The goal is to provide
-a functionality similar to what is described in TOGL; see
-https://github.com/BorgwardtLab/TOGL.
+Implemented helpers:
+    - validation of anchored, injective integer filtrations with gaps
+    - Algorithm 1 unit-step candidate scoring and selection
+    - Algorithm 2 direct-move and adjacent-swap realisation
 
-At the moment, the following functionality is present:
-    - simple deep set layer
-    - simple TOGL implementation with deep set functions
-    - basic GCN with TOGL
+The QiHOTOGL class currently retains the inherited TOGL forward
+computation based on persistence pairs, DeepSets and a node residual.
+The helpers are not yet connected to its training pipeline.
 
-The following aspects are currently ignored:
-    - handling higher-order information properly
-    - expanding simplicial complexes
-    - making use of the dimension of features
+Next mathematical component:
+    Hodge moment matrices, following the manuscript's definitions.
 
-On the other hand, the current implementation is simplified in the sense
-of showing that *lower star filtrations* (and their corresponding
-generators) may be useful.
+Original TOGL reference:
+    https://github.com/BorgwardtLab/TOGL
 """
 
 import torch
@@ -165,11 +162,14 @@ def realise_filtration_direction(t, sigma, m, direction, k):
 def select_filtration_direction(t, sigma, phi, gamma, k):
     """Select the best positive provisional direction, Algorithm 1.
 
-    phi and gamma have shape [k, z] for one graph and one view.
-    gamma is the NEGATIVE classification-loss gradient.
+    Implements unit steps (epsilon = 1) for one graph and one view.
+    phi and gamma have shape [k, z]; gamma is the NEGATIVE loss gradient.
+    Moment columns for selected dimensions may be concatenated.
 
+    Ties prefer the smallest arrival rank, then decrement over increment.
     Return (rank, direction, score), or None if no positive candidate.
-    This function does not modify t or realise the selected direction.
+    Inputs remain unchanged. Algorithm 2 realises the selected direction
+    separately; provisional scoring and swap realisation are distinct.
     """
     expected_sigma = validate_current_filtration(t, k)
 
@@ -267,11 +267,12 @@ class DeepSetLayer(nn.Module):
 
 
 class QiHOTOGL(nn.Module):
-    """Implementation of TOGL, a topological graph layer.
+    """QiHOTOGL scaffold adapted from the TOGL graph layer.
 
-    Some caveats: this implementation only focuses on a set function
-    aggregation of topological features. At the moment, it is not as
-    powerful and feature-complete as the original implementation.
+    The current forward pass still computes TOGL persistence features.
+    Hard neural decoding, Hodge moments and selectable backward modes
+    will be integrated progressively. This is not yet the complete
+    QiHOTOGL layer.
     """
 
     def __init__(
@@ -505,7 +506,5 @@ if __name__ == "__main__":
         print(batch)
         batch = batch.to(dev)
 
-        vertex_slices = torch.Tensor(batch._slice_dict["x"]).long()
-        edge_slices = torch.Tensor(batch._slice_dict["edge_index"]).long()
 
         model(batch)
