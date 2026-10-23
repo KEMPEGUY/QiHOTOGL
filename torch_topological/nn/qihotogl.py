@@ -912,6 +912,86 @@ def monte_carlo_hodge_moment_matrices(
     return matrices
 
 
+@torch.no_grad()
+def decode_filtration_scores(
+    scores, k, mode="score_gaps", tau=1.0
+):
+    """Decode one graph/view into an anchored injective filtration.
+
+    Return (t, sigma), both integer tensors on scores.device.
+    Stable ascending sorting resolves equal scores by vertex index.
+
+    rank:
+        Assign consecutive levels 1 through n.
+    score_gaps:
+        Add rounded, nondecreasing offsets determined by score
+        distances from the minimum. tau controls the gap scale.
+
+    This hard decoder supplies no ordinary gradient through its
+    discrete decisions. Surrogate backward rules are separate.
+    """
+    import math
+
+    if not isinstance(scores, torch.Tensor):
+        raise TypeError("scores must be a torch.Tensor.")
+    if scores.ndim != 1 or scores.numel() == 0:
+        raise ValueError("scores must be a nonempty vector.")
+    if not scores.is_floating_point():
+        raise TypeError("scores must have a floating-point dtype.")
+    if not torch.isfinite(scores).all().item():
+        raise ValueError("scores must be finite.")
+
+    if isinstance(k, bool) or not isinstance(k, int):
+        raise TypeError("k must be a Python integer.")
+
+    n = scores.numel()
+    if k < n:
+        raise ValueError("k must be at least the number of vertices.")
+    if k > torch.iinfo(torch.int64).max:
+        raise ValueError("k exceeds the supported integer range.")
+
+    if mode not in ("rank", "score_gaps"):
+        raise ValueError("mode must be 'rank' or 'score_gaps'.")
+
+    if isinstance(tau, bool) or not isinstance(tau, (int, float)):
+        raise TypeError("tau must be a Python number.")
+    tau = float(tau)
+    if not math.isfinite(tau) or tau <= 0:
+        raise ValueError("tau must be finite and positive.")
+
+    sigma = torch.argsort(scores, stable=True)
+    levels = torch.arange(
+        1, n + 1, dtype=torch.long, device=scores.device
+    )
+    extra = k - n
+
+    if mode == "score_gaps" and extra > 0:
+        # Float64 reduces rounding error in score normalization.
+        ordered = scores[sigma].to(torch.float64)
+        distances = ordered - ordered[0]
+        scaled = (distances / tau).clamp(min=0.0, max=1.0)
+
+        # Avoid silently losing integer precision for huge grids.
+        if extra > 2**52:
+            raise ValueError(
+                "score_gaps supports k - n up to 2**52."
+            )
+
+        offsets = torch.floor(extra * scaled + 0.5).long()
+        offsets = offsets.clamp(min=0, max=extra)
+        levels = levels + offsets
+
+    t = torch.empty(n, dtype=torch.long, device=scores.device)
+    t[sigma] = levels
+
+    # Check the same admissibility contract used by the optimizer.
+    checked_sigma = validate_current_filtration(t, k)
+    if not torch.equal(sigma, checked_sigma):
+        raise RuntimeError("Decoded ordering is inconsistent.")
+
+    return t, sigma
+
+
 class DeepSetLayer(nn.Module):
     """Simple equivariant deep set layer."""
 
