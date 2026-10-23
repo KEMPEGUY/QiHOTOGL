@@ -813,6 +813,105 @@ def estimate_hodge_walk_moments(
     return totals / n_samples
 
 
+@torch.no_grad()
+def monte_carlo_hodge_moment_matrices(
+    edge_index,
+    t,
+    k,
+    q_values,
+    z_max,
+    n_samples,
+    seed=0,
+    batch_size=4096,
+    device="cpu",
+):
+    """Estimate moment matrices for one graph and one filtration.
+
+    Return a dictionary mapping each requested q to a [k, z_max]
+    tensor. Provisional tied levels are allowed. Unchanged complexes
+    reuse the preceding row, preserving block-constant matrices.
+    """
+    for name, value in (
+        ("k", k),
+        ("z_max", z_max),
+        ("n_samples", n_samples),
+        ("batch_size", batch_size),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(name + " must be a Python integer.")
+        if value < 1:
+            raise ValueError(name + " must be positive.")
+
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be a Python integer.")
+
+    q_values = tuple(q_values)
+    if not q_values:
+        raise ValueError("Select at least one simplex dimension.")
+
+    for q in q_values:
+        if isinstance(q, bool) or not isinstance(q, int):
+            raise TypeError("Each q must be a Python integer.")
+        if q < 0:
+            raise ValueError("Simplex dimensions must be nonnegative.")
+
+    if len(set(q_values)) != len(q_values):
+        raise ValueError("Selected dimensions must be distinct.")
+
+    # Reuse the complex builder's validation of edges and assignments.
+    # It permits ties, which are needed for provisional move scoring.
+    filtered_clique_simplices(
+        edge_index, t, level=1, max_dim=0
+    )
+
+    if k < t.numel():
+        raise ValueError("k must be at least the number of vertices.")
+    if t.max().item() > k:
+        raise ValueError("Filtration levels must not exceed k.")
+
+    matrices = {}
+
+    for q in q_values:
+        rows = []
+        previous_active = None
+        previous_row = None
+
+        for level in range(1, k + 1):
+            active = tuple(
+                torch.nonzero(t <= level, as_tuple=False)
+                .flatten().tolist()
+            )
+
+            if active != previous_active:
+                sparse = sparse_reflected_hodge_columns(
+                    edge_index, t, level=level, q=q
+                )
+                table = prepare_hodge_walk_table(
+                    sparse, device=device
+                )
+
+                # Deterministic seeds indexed by dimension and level.
+                # The result does not depend on q_values ordering.
+                local_seed = (
+                    seed + q * (k + 1) + level
+                ) % (2**63 - 1)
+
+                previous_row = estimate_hodge_walk_moments(
+                    table,
+                    z_max=z_max,
+                    n_samples=n_samples,
+                    seed=local_seed,
+                    batch_size=batch_size,
+                )
+                previous_active = active
+
+            rows.append(previous_row)
+
+        matrices[q] = torch.stack(rows, dim=0)
+
+    return matrices
+
+
 class DeepSetLayer(nn.Module):
     """Simple equivariant deep set layer."""
 
