@@ -1,24 +1,23 @@
-"""QiHOTOGL development module adapted from the TOGL graph example.
+"""Experimental QiHOTOGL graph layer and small training demonstration.
 
-Implemented helpers:
-    - validation of anchored, injective integer filtrations with gaps
-    - Algorithm 1 unit-step candidate scoring and selection
-    - Algorithm 2 unit-step direct-move and adjacent-swap realisation
-    - filtered clique complexes and oriented boundary matrices
-    - exact-reference Hodge moments for selectable simplex dimensions
+The layer decodes anchored, injective neural vertex filtrations, computes
+exact or Monte Carlo Hodge moments, and projects graph moment features
+into residual node corrections.
 
-Filtration moves currently use epsilon = 1.
-General epsilon-perturbations are not yet implemented.
+Training uses classification backward followed by explicit M2/M3
+surrogate backward before one optimizer step. Teacher moves provide
+learning signals; they do not overwrite neural-decoded filtrations.
+Inference uses neural decoding without teacher selection.
 
-Exact-reference moments use H_q = I - Delta_q / n_r, with n_r the
-active vertex count. Empty q-chain spaces have zero moment rows.
-Calculations use dense CPU float64 tensors for small reference graphs.
+Candidate moves currently use epsilon = 1. M2/M3 are surrogate rules,
+not exact derivatives of the hard decoder. Other backward modes remain
+pending. Exact moments use dense reference calculations for small graphs.
 
-The QiHOTOGL class still retains the inherited TOGL forward computation.
-The new helpers are not yet connected to its training pipeline.
+Run the recorded demonstration with:
+    python -m torch_topological.nn.qihotogl
 
-Next components:
-    Monte Carlo estimation, hard neural decoding, and backward integration.
+The synthetic experiment checks training behavior and records metrics;
+it does not establish a general classification advantage.
 
 Original TOGL reference:
     https://github.com/BorgwardtLab/TOGL
@@ -1457,53 +1456,210 @@ class QiHOTOGL(nn.Module):
 
 
 class TopoGCN(torch.nn.Module):
-    def __init__(self):
+    """Small GCN with an explicit QiHOTOGL training interface."""
+
+    def __init__(self, backward_mode="M3"):
         super().__init__()
-
-        self.layers = nn.ModuleList([GCNConv(1, 8), GCNConv(8, 2)])
-
-        self.pooling_fn = global_mean_pool
-        self.togl = QiHOTOGL(8, 16, 32, 16, "mean")
+        self.backbone = GCNConv(1, 4)
+        self.topology = QiHOTOGL(
+            4, 2, 8, 8, "mean",
+            k=8, q_values=(0, 1), z_max=3,
+            moment_method="exact",
+            backward_mode=backward_mode,
+        )
+        self.classifier = nn.Linear(4, 2)
 
     def forward(self, data):
-        x, edge_index = data.x, data.edge_index
+        h = torch.tanh(self.backbone(data.x, data.edge_index))
+        h = self.topology(h, data)
+        return self.classifier(global_mean_pool(h, data.batch))
 
-        for layer in self.layers[:1]:
-            x = layer(x, edge_index)
 
-        x = self.togl(x, data)
+def run_training_demo():
+    """Compare surrogate modes on six-node synthetic graphs."""
+    import csv
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from torch_geometric.data import Batch
 
-        for layer in self.layers[1:]:
-            x = layer(x, edge_index)
+    torch.set_num_threads(1)
+    dataset_seed = 1729
+    model_seed = 42
+    epochs = 15
+    learning_rate = 0.01
+    generator = torch.Generator().manual_seed(dataset_seed)
 
-        x = self.pooling_fn(x, data.batch)
-        return x
+    def make_graph(label):
+        # Both classes have six vertices, six edges and degree two.
+        # Class 0: one six-cycle. Class 1: two disjoint triangles.
+        if label == 0:
+            pairs = [(i, (i + 1) % 6) for i in range(6)]
+        else:
+            pairs = [
+                (0, 1), (1, 2), (2, 0),
+                (3, 4), (4, 5), (5, 3),
+            ]
+        permutation = torch.randperm(6, generator=generator)
+        directed = [
+            (int(permutation[a]), int(permutation[b]))
+            for u, v in pairs for a, b in ((u, v), (v, u))
+        ]
+        return Data(
+            x=torch.rand((6, 1), generator=generator),
+            edge_index=torch.tensor(directed, dtype=torch.long).t().contiguous(),
+            y=torch.tensor([label], dtype=torch.long),
+        )
+
+    train = Batch.from_data_list([make_graph(i % 2) for i in range(12)])
+    test = Batch.from_data_list([make_graph(i % 2) for i in range(8)])
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    directory = Path("runs") / ("qihotogl_small_" + stamp)
+    directory.mkdir(parents=True, exist_ok=False)
+
+    config = {
+        "dataset_seed": dataset_seed,
+        "model_seed": model_seed,
+        "epochs": epochs,
+        "learning_rate": learning_rate,
+        "train_graphs": 12,
+        "test_graphs": 8,
+        "moment_method": "exact",
+        "k": 8,
+        "q_values": [0, 1],
+        "z_max": 3,
+        "views": 2,
+        "control": "Scorer weights fixed; shared backbone still learns.",
+        "task": "Six-cycle versus two disjoint triangles.",
+    }
+    (directory / "config.json").write_text(json.dumps(config, indent=2))
+    torch.save({"train": train, "test": test}, directory / "dataset.pt")
+
+    def evaluate(model, batch):
+        model.eval()
+        with torch.no_grad():
+            logits = model(batch)
+            loss = nn.functional.cross_entropy(logits, batch.y).item()
+            accuracy = (logits.argmax(1) == batch.y).float().mean().item()
+        return loss, accuracy
+
+    fields = [
+        "mode", "epoch", "train_loss", "train_accuracy",
+        "test_loss", "test_accuracy", "selected_moves",
+        "scorer_grad_norm", "changed_views", "changed_vertices",
+    ]
+
+    with (directory / "metrics.csv").open("w", newline="") as handle, (
+        directory / "filtrations.jsonl"
+    ).open("w") as filtration_log:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+
+        for mode in ("no_surrogate", "M2", "M3"):
+            # Identical model initialization in every arm.
+            torch.manual_seed(model_seed)
+            model = TopoGCN("M3" if mode == "no_surrogate" else mode)
+            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+            previous = None
+            initial_scorer = [
+                p.detach().clone() for p in model.topology.filtrations.parameters()
+            ]
+
+            train_loss, train_accuracy = evaluate(model, train)
+            test_loss, test_accuracy = evaluate(model, test)
+            writer.writerow(dict(
+                mode=mode, epoch=0,
+                train_loss=train_loss, train_accuracy=train_accuracy,
+                test_loss=test_loss, test_accuracy=test_accuracy,
+                selected_moves="", scorer_grad_norm="",
+                changed_views="", changed_vertices="",
+            ))
+
+            for epoch in range(1, epochs + 1):
+                model.train()
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(train)
+
+                contexts = model.topology._training_contexts
+                current = torch.stack([
+                    context["t"].detach().cpu().clone()
+                    for _, context in contexts
+                ])
+                if previous is None:
+                    changed_views = changed_vertices = 0
+                else:
+                    difference = current != previous
+                    changed_views = int(difference.any(dim=1).sum())
+                    changed_vertices = int(difference.sum())
+                previous = current.clone()
+
+                loss = nn.functional.cross_entropy(logits, train.y)
+                loss.backward(retain_graph=(mode != "no_surrogate"))
+
+                if mode == "no_surrogate":
+                    model.topology.clear_training_context()
+                    events = []
+                else:
+                    events = model.topology.backward_surrogate()
+
+                selected = sum(event["selected"] is not None for event in events)
+                grad_squared = sum(
+                    float(p.grad.detach().square().sum())
+                    for p in model.topology.filtrations.parameters()
+                    if p.grad is not None
+                )
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        if not torch.isfinite(parameter.grad).all():
+                            raise RuntimeError("Nonfinite gradient.")
+
+                optimizer.step()
+
+                if mode == "no_surrogate":
+                    assert all(
+                        torch.equal(before, after.detach())
+                        for before, after in zip(
+                            initial_scorer,
+                            model.topology.filtrations.parameters(),
+                        )
+                    )
+
+                # Metrics are evaluated after the optimizer update.
+                train_loss, train_accuracy = evaluate(model, train)
+                test_loss, test_accuracy = evaluate(model, test)
+                writer.writerow(dict(
+                    mode=mode, epoch=epoch,
+                    train_loss=train_loss, train_accuracy=train_accuracy,
+                    test_loss=test_loss, test_accuracy=test_accuracy,
+                    selected_moves=selected,
+                    scorer_grad_norm=grad_squared ** 0.5,
+                    changed_views=changed_views,
+                    changed_vertices=changed_vertices,
+                ))
+                filtration_log.write(json.dumps({
+                    "mode": mode,
+                    "epoch": epoch,
+                    "timing": "training forward before optimizer update",
+                    "t": current.tolist(),
+                    "selected": [event["selected"] for event in events],
+                }) + "\n")
+                handle.flush()
+                filtration_log.flush()
+
+                print(
+                    f"{mode:12s} epoch={epoch:02d} "
+                    f"train_loss={train_loss:.4f} "
+                    f"train_acc={train_accuracy:.3f} "
+                    f"test_acc={test_accuracy:.3f} "
+                    f"moves={selected:2d} changed_views={changed_views:2d}",
+                    flush=True,
+                )
+
+            torch.save(model.state_dict(), directory / (mode + ".pt"))
+
+    print("Results saved:", directory)
 
 
 if __name__ == "__main__":
-    B = 64
-    N = 100
-    p = 0.2
-
-    if torch.cuda.is_available():
-        dev = "cuda:0"
-    else:
-        dev = "cpu"
-
-    print("Selected device:", dev)
-
-    data_list = [
-        Data(x=torch.rand(N, 1), edge_index=erdos_renyi_graph(N, p), num_nodes=N)
-        for i in range(B)
-    ]
-
-    loader = DataLoader(data_list, batch_size=8)
-
-    model = TopoGCN().to(dev)
-
-    for index, batch in enumerate(loader):
-        print(batch)
-        batch = batch.to(dev)
-
-
-        model(batch)
+    run_training_demo()
