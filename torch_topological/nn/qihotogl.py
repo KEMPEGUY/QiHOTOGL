@@ -992,6 +992,105 @@ def decode_filtration_scores(
     return t, sigma
 
 
+@torch.no_grad()
+def prepare_filtration_teacher(
+    scores,
+    edge_index,
+    k,
+    q_values,
+    z_max,
+    decoder_mode="score_gaps",
+    tau=1.0,
+    moment_method="exact",
+    n_samples=10000,
+    seed=0,
+    batch_size=4096,
+):
+    """Prepare one graph/view before classification backward.
+
+    phi concatenates the selected q blocks along the moment columns.
+    This helper creates no autograd connection to the scores.
+    """
+    q_values = tuple(q_values)
+    t, sigma = decode_filtration_scores(
+        scores, k, mode=decoder_mode, tau=tau
+    )
+
+    if moment_method == "exact":
+        matrices = exact_hodge_moment_matrices(
+            edge_index, t, k, q_values, z_max
+        )
+    elif moment_method == "monte_carlo":
+        matrices = monte_carlo_hodge_moment_matrices(
+            edge_index, t, k, q_values, z_max,
+            n_samples=n_samples,
+            seed=seed,
+            batch_size=batch_size,
+            device=scores.device,
+        )
+    else:
+        raise ValueError(
+            "moment_method must be 'exact' or 'monte_carlo'."
+        )
+
+    phi = torch.cat(
+        [matrices[q] for q in q_values], dim=1
+    ).to(scores.device)
+
+    return {
+        "t": t,
+        "sigma": sigma,
+        "k": k,
+        "q_values": q_values,
+        "z_max": z_max,
+        "phi": phi,
+        "moment_method": moment_method,
+    }
+
+
+@torch.no_grad()
+def single_step_filtration_teacher(context, gamma):
+    """Select and realise at most one direction for one graph/view.
+
+    gamma must be the NEGATIVE classification-loss gradient with
+    respect to context["phi"], with matching shape, dtype and device.
+
+    Selection scores provisional moves. A realised swap can have a
+    different moment change. The selection score is not a guarantee
+    of realised loss decrease.
+
+    Monte Carlo input produces estimated, noise-sensitive scores.
+    """
+    t = context["t"]
+    sigma = context["sigma"]
+    phi = context["phi"]
+    k = context["k"]
+
+    selected = select_filtration_direction(
+        t, sigma, phi, gamma, k
+    )
+
+    if selected is None:
+        target_t = t.clone()
+        target_sigma = sigma.clone()
+        move_type = "none"
+    else:
+        m, direction, score = selected
+        target_t, target_sigma, move_type = (
+            realise_filtration_direction(
+                t, sigma, m, direction, k
+            )
+        )
+
+    return {
+        "selected": selected,
+        "target_t": target_t,
+        "target_sigma": target_sigma,
+        "displacement": target_t.long() - t.long(),
+        "move_type": move_type,
+    }
+
+
 class DeepSetLayer(nn.Module):
     """Simple equivariant deep set layer."""
 
