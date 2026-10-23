@@ -1188,12 +1188,18 @@ class DeepSetLayer(nn.Module):
 
 
 class QiHOTOGL(nn.Module):
-    """QiHOTOGL scaffold adapted from the TOGL graph layer.
+    """Experimental batched moment-based graph layer.
 
-    The current forward pass still computes TOGL persistence features.
-    Hard neural decoding, Hodge moments and selectable backward modes
-    will be integrated progressively. This is not yet the complete
-    QiHOTOGL layer.
+    Each graph/view produces an anchored hard filtration and moments.
+    A graph-level correction is broadcast to its node embeddings.
+
+    Training:
+        loss.backward(retain_graph=True)
+        layer.backward_surrogate()
+        optimizer.step()
+
+    M2/M3 are detached surrogate rules, not exact decoder gradients.
+    Only one outstanding training forward is supported per instance.
     """
 
     def __init__(
@@ -1203,10 +1209,71 @@ class QiHOTOGL(nn.Module):
         hidden_dim,
         out_dim,
         aggregation_fn,
+        *,
+        k=128,
+        q_values=(0, 1),
+        z_max=4,
+        decoder_mode="score_gaps",
+        tau=1.0,
+        moment_method="exact",
+        backward_mode="M3",
+        n_samples=10000,
+        seed=0,
+        batch_size=4096,
     ):
         super().__init__()
 
+        for name, value in (
+            ("n_features", n_features),
+            ("n_filtrations", n_filtrations),
+            ("hidden_dim", hidden_dim),
+            ("out_dim", out_dim),
+            ("k", k),
+            ("z_max", z_max),
+            ("n_samples", n_samples),
+            ("batch_size", batch_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a Python integer.")
+            if value < 1:
+                raise ValueError(name + " must be positive.")
+
+        q_values = tuple(q_values)
+        if not q_values or any(
+            isinstance(q, bool) or not isinstance(q, int) or q < 0
+            for q in q_values
+        ):
+            raise ValueError("q_values must contain nonnegative integers.")
+        if len(set(q_values)) != len(q_values):
+            raise ValueError("q_values must be distinct.")
+        if moment_method not in ("exact", "monte_carlo"):
+            raise ValueError("Unknown moment method.")
+        if backward_mode not in ("M2", "M3"):
+            raise ValueError("This version supports M2 and M3.")
+        if aggregation_fn != "mean":
+            raise ValueError(
+                "This graph-moment version currently supports 'mean'."
+            )
+
+        # Validate decoder options using a one-vertex assignment.
+        decode_filtration_scores(
+            torch.zeros(1), k, mode=decoder_mode, tau=tau
+        )
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("seed must be a Python integer.")
+
+        self.n_features = n_features
         self.n_filtrations = n_filtrations
+        self.k = k
+        self.q_values = q_values
+        self.z_max = z_max
+        self.decoder_mode = decoder_mode
+        self.tau = tau
+        self.moment_method = moment_method
+        self.backward_mode = backward_mode
+        self.n_samples = n_samples
+        self.seed = seed
+        self.walk_batch_size = batch_size
 
         self.filtrations = nn.Sequential(
             nn.Linear(n_features, hidden_dim),
@@ -1214,168 +1281,179 @@ class QiHOTOGL(nn.Module):
             nn.Linear(hidden_dim, n_filtrations),
         )
 
-        self.set_fn = nn.ModuleList(
-            [
-                nn.Linear(n_filtrations * 2, out_dim),
-                nn.ReLU(),
-                DeepSetLayer(out_dim, out_dim, aggregation_fn),
-                nn.ReLU(),
-                DeepSetLayer(
-                    out_dim,
-                    n_features,
-                    aggregation_fn,
-                ),
-            ]
+        feature_count = (
+            n_filtrations * len(q_values) * k * z_max
+        )
+        self.moment_projector = nn.Sequential(
+            nn.Linear(feature_count, out_dim),
+            nn.ReLU(),
+            nn.Linear(out_dim, n_features),
         )
 
-        self.batch_norm = nn.BatchNorm1d(n_features)
+        self._training_contexts = None
 
-    def compute_persistent_homology(
-        self,
-        x,
-        edge_index,
-        vertex_slices,
-        edge_slices,
-        batch,
-        n_nodes,
-        return_filtration=False,
-    ):
-        """Return persistence pairs (i.e. generators)."""
-        # Apply filtrations to node attributes. For the edge values, we
-        # use a sublevel set filtration.
-        #
-        # TODO: Support different ways of filtering?
-        filtered_v = self.filtrations(x)
-        filtered_e, _ = torch.max(
-            torch.stack(
-                (filtered_v[edge_index[0]], filtered_v[edge_index[1]])
-            ),
-            axis=0,
-        )
-
-        filtered_v = filtered_v.transpose(1, 0).cpu().contiguous()
-        filtered_e = filtered_e.transpose(1, 0).cpu().contiguous()
-        edge_index = edge_index.cpu().transpose(1, 0).contiguous()
-
-        # TODO: Do we have to enforce contiguous indices here?
-        vertex_index = torch.arange(end=n_nodes, dtype=torch.int)
-
-        # Fill all persistence information at the same time.
-        persistence_diagrams = torch.empty(
-            (self.n_filtrations, n_nodes, 2),
-            dtype=torch.float,
-        )
-
-        for filt_index in range(self.n_filtrations):
-            for (vi, vj), (ei, ej) in zip(
-                pairwise(vertex_slices), pairwise(edge_slices)
-            ):
-                vertices = vertex_index[vi:vj]
-                edges = edge_index[ei:ej]
-
-                offset = vi
-
-                f_vertices = filtered_v[filt_index][vi:vj]
-                f_edges = filtered_e[filt_index][ei:ej]
-
-                persistence_diagram = self._compute_persistent_homology(
-                    vertices, f_vertices, edges, f_edges, offset
-                )
-
-                persistence_diagrams[filt_index, vi:vj] = persistence_diagram
-
-        # Make sure that the tensor is living on the proper device here;
-        # all subsequent operations can happen either on the CPU *or* on
-        # the GPU.
-        persistence_diagrams = persistence_diagrams.to(x.device)
-        return persistence_diagrams
-
-    # Helper function for doing the actual calculation of topological
-    # features of a graph.
-    def _compute_persistent_homology(
-        self, vertices, f_vertices, edges, f_edges, offset
-    ):
-        assert len(vertices) == len(f_vertices)
-        assert len(edges) == len(f_edges)
-
-        st = gd.SimplexTree()
-
-        for v, f in zip(vertices, f_vertices):
-            st.insert([v], filtration=f)
-
-        for (u, v), f in zip(edges, f_edges):
-            st.insert([u, v], filtration=f)
-
-        st.make_filtration_non_decreasing()
-        st.expansion(2)
-        st.persistence()
-
-        # The generators are split into "regular" and "essential"
-        # vertices, sorted by dimension.
-        generators = st.lower_star_persistence_generators()
-        generators_regular, generators_essential = generators
-
-        # TODO: Let's think about how to leverage *all* generators in
-        # *all* dimensions.
-        generators_regular = torch.as_tensor(generators_regular[0])
-        generators_regular = generators_regular - offset
-        generators_regular = generators_regular.sort(dim=0, stable=True)[0]
-
-        # By default, every vertex is paired with itself, so we just
-        # duplicate the information here.
-        persistence_diagram = torch.stack((f_vertices, f_vertices), dim=1)
-
-        # Map generators back to filtration values, thus adding non-trivial
-        # tuples to the persistence diagram while preserving gradients.
-        if len(generators_regular) > 0:
-            persistence_diagram[generators_regular[:, 0], 1] = f_vertices[
-                generators_regular[:, 1]
-            ]
-
-        return persistence_diagram
+    def clear_training_context(self):
+        """Explicitly discard an outstanding training context."""
+        self._training_contexts = None
 
     def forward(self, x, data):
-        """Implement forward pass through data."""
-        # TODO: Is this the best signature? `data` is following directly
-        # the convention of `PyG`.
-        #
-        # x : current node attributes of layer; we should not use the
-        # original attributes here because they are not informed by a
-        # previous layer.
-        #
-        # data : edge slice information etc.
+        """Return node embeddings with graph-level moment corrections."""
+        if self._training_contexts is not None:
+            raise RuntimeError(
+                "Previous training context is pending. Call "
+                "backward_surrogate() or clear_training_context()."
+            )
 
-        edge_index = data.edge_index
+        if x.ndim != 2 or x.shape[1] != self.n_features:
+            raise ValueError("Unexpected node-feature shape.")
+        if x.shape[0] == 0 or not x.is_floating_point():
+            raise ValueError("Expected nonempty floating node features.")
 
-        vertex_slices = torch.Tensor(data._slice_dict["x"]).long()
-        edge_slices = torch.Tensor(data._slice_dict["edge_index"]).long()
-        batch = data.batch
+        edges = data.edge_index.to(device=x.device)
+        if edges.dtype != torch.long:
+            raise TypeError("edge_index must use torch.long.")
+        if edges.ndim != 2 or edges.shape[0] != 2:
+            raise ValueError("edge_index must have shape [2, E].")
+        if edges.numel() and (
+            edges.min().item() < 0
+            or edges.max().item() >= x.shape[0]
+        ):
+            raise ValueError("Edge vertex index is out of range.")
 
-        persistence_pairs = self.compute_persistent_homology(
-            x,
-            edge_index,
-            vertex_slices,
-            edge_slices,
-            batch,
-            n_nodes=data.num_nodes,
+        batch = getattr(data, "batch", None)
+        if batch is None:
+            batch = torch.zeros(
+                x.shape[0], dtype=torch.long, device=x.device
+            )
+        else:
+            batch = batch.to(device=x.device)
+
+        if batch.dtype != torch.long or batch.shape != (x.shape[0],):
+            raise ValueError("batch must be a long vector per node.")
+
+        graph_ids = torch.unique(batch, sorted=True)
+        expected_ids = torch.arange(
+            graph_ids.numel(), device=x.device
         )
+        if not torch.equal(graph_ids, expected_ids):
+            raise ValueError("Batch IDs must be consecutive from zero.")
 
-        x0 = persistence_pairs.permute(1, 0, 2).reshape(
-            persistence_pairs.shape[1], -1
+        if edges.numel() and torch.any(
+            batch[edges[0]] != batch[edges[1]]
+        ).item():
+            raise ValueError("Edges cannot connect different graphs.")
+
+        # Reject oversized graphs before computing any moments.
+        for graph_id in range(graph_ids.numel()):
+            if (batch == graph_id).sum().item() > self.k:
+                raise ValueError("Every graph must satisfy n <= k.")
+
+        scores = self.filtrations(x)
+        collect = self.training and torch.is_grad_enabled()
+        contexts = []
+        graph_features = []
+
+        for graph_id in range(graph_ids.numel()):
+            nodes = torch.nonzero(
+                batch == graph_id, as_tuple=False
+            ).flatten()
+
+            # Convert batch-global vertex indices to local indices.
+            mapping = torch.full(
+                (x.shape[0],), -1,
+                dtype=torch.long, device=x.device,
+            )
+            mapping[nodes] = torch.arange(
+                nodes.numel(), device=x.device
+            )
+            edge_mask = batch[edges[0]] == graph_id
+            local_edges = mapping[edges[:, edge_mask]]
+            graph_scores = scores[nodes]
+            views = []
+
+            for view in range(self.n_filtrations):
+                view_scores = graph_scores[:, view]
+                context = prepare_filtration_teacher(
+                    view_scores,
+                    local_edges,
+                    self.k,
+                    self.q_values,
+                    self.z_max,
+                    decoder_mode=self.decoder_mode,
+                    tau=self.tau,
+                    moment_method=self.moment_method,
+                    n_samples=self.n_samples,
+                    seed=self.seed
+                    + graph_id * self.n_filtrations + view,
+                    batch_size=self.walk_batch_size,
+                )
+
+                # Cast BEFORE making the classifier-input leaf.
+                phi = context["phi"].to(
+                    device=x.device, dtype=x.dtype
+                ).detach()
+                if collect:
+                    phi.requires_grad_(True)
+                    context["phi"] = phi
+                    contexts.append((view_scores, context))
+
+                views.append(phi.flatten())
+
+            graph_features.append(torch.cat(views))
+
+        features = torch.stack(graph_features)
+        correction = self.moment_projector(features)
+        output = x + correction[batch]
+
+        if collect:
+            self._training_contexts = contexts
+
+        return output
+
+    def backward_surrogate(self, mode=None, retain_graph=False):
+        """Inject teacher signals after classification backward.
+
+        Call once, before optimizer.step(). Returns detached event data.
+        All views/graphs are backpropagated together.
+        """
+        mode = self.backward_mode if mode is None else mode
+        if mode not in ("M2", "M3"):
+            raise ValueError("This version supports M2 and M3.")
+
+        contexts = self._training_contexts
+        if contexts is None:
+            raise RuntimeError("No pending training forward.")
+
+        # Check all views before starting the second backward pass.
+        for scores, context in contexts:
+            if context["phi"].grad is None:
+                raise RuntimeError(
+                    "Run loss.backward(retain_graph=True) first."
+                )
+            if not scores.requires_grad:
+                raise RuntimeError("Scorer outputs require gradients.")
+
+        score_tensors = []
+        signals = []
+        events = []
+
+        for scores, context in contexts:
+            gamma = -context["phi"].grad.detach()
+            teacher = single_step_filtration_teacher(context, gamma)
+            signal = filtration_surrogate_signal(
+                scores, context, teacher, mode
+            )
+            score_tensors.append(scores)
+            signals.append(signal)
+            events.append(teacher)
+
+        torch.autograd.backward(
+            score_tensors,
+            grad_tensors=signals,
+            retain_graph=retain_graph,
         )
-
-        for layer in self.set_fn:
-            # Preserve batch information for our set function layer
-            # instead of treating all inputs the same.
-            if isinstance(layer, DeepSetLayer):
-                x0 = layer(x0, batch)
-            else:
-                x0 = layer(x0)
-
-        # TODO: Residual step; could be made optional. Plus, the optimal
-        # order of operations is not clear.
-        x = x + self.batch_norm(nn.functional.relu(x0))
-        return x
+        self._training_contexts = None
+        return events
 
 
 class TopoGCN(torch.nn.Module):
