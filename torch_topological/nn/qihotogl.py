@@ -1091,6 +1091,66 @@ def single_step_filtration_teacher(context, gamma):
     }
 
 
+@torch.no_grad()
+def filtration_surrogate_signal(
+    scores, context, teacher, mode="M3"
+):
+    """Construct an experimental M2 or M3 score-gradient signal.
+
+    M2: -S * direction * one_hot(selected_vertex).
+    M3: -S * realised_displacement.
+
+    S is the positive provisional score returned by SELECT.
+    This is a detached surrogate, not an exact decoder derivative.
+    """
+    import math
+
+    if mode not in ("M2", "M3"):
+        raise ValueError("mode must be 'M2' or 'M3'.")
+
+    if not isinstance(scores, torch.Tensor):
+        raise TypeError("scores must be a torch.Tensor.")
+    if scores.ndim != 1 or not scores.is_floating_point():
+        raise ValueError("scores must be a floating-point vector.")
+    if scores.numel() != context["t"].numel():
+        raise ValueError("scores and filtration sizes must match.")
+    if not torch.isfinite(scores).all().item():
+        raise ValueError("scores must be finite.")
+
+    signal = torch.zeros_like(scores)
+    selected = teacher["selected"]
+
+    if selected is None:
+        return signal
+
+    m, direction, score = selected
+    score = float(score)
+
+    if not math.isfinite(score) or score <= 0:
+        raise ValueError("Selected score must be finite and positive.")
+    if direction not in ("-", "+"):
+        raise ValueError("Unknown selected direction.")
+    if not 1 <= m < scores.numel():
+        raise ValueError("Selected rank must be movable.")
+
+    if mode == "M2":
+        vertex = int(context["sigma"][m].item())
+        delta = -1 if direction == "-" else 1
+        signal[vertex] = -score * delta
+    else:
+        displacement = teacher["displacement"]
+        if displacement.shape != scores.shape:
+            raise ValueError("Displacement shape must match scores.")
+        signal = -score * displacement.to(
+            device=scores.device, dtype=scores.dtype
+        )
+
+    if not torch.isfinite(signal).all().item():
+        raise ValueError("Surrogate signal overflowed.")
+
+    return signal
+
+
 class DeepSetLayer(nn.Module):
     """Simple equivariant deep set layer."""
 
