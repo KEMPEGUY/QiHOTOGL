@@ -1177,6 +1177,8 @@ def filtration_surrogate_signal(
         a topmost increment uses the selected score as its boundary.
         No direction multiplier, centering or auxiliary objective is added.
     M2: -S * direction * one_hot(selected_vertex).
+    M2-pair: M2 credit on both swap vertices, with the same sign;
+        direct moves retain ordinary M2 credit.
     M3: -S * realised_displacement.
 
     S is the positive provisional score returned by SELECT.
@@ -1184,8 +1186,8 @@ def filtration_surrogate_signal(
     """
     import math
 
-    if mode not in ("M0", "M1", "M2", "M3"):
-        raise ValueError("mode must be 'M0', 'M1', 'M2' or 'M3'.")
+    if mode not in ("M0", "M1", "M2", "M2-pair", "M3"):
+        raise ValueError("mode must be 'M0', 'M1', 'M2', 'M2-pair' or 'M3'.")
 
     if not isinstance(scores, torch.Tensor):
         raise TypeError("scores must be a torch.Tensor.")
@@ -1246,10 +1248,36 @@ def filtration_surrogate_signal(
             m1_alpha * (scores - boundary)
         )
 
-    elif mode == "M2":
+    elif mode in ("M2", "M2-pair"):
         vertex = int(context["sigma"][m].item())
         delta = -1 if direction == "-" else 1
         signal[vertex] = -score * delta
+
+        if mode == "M2-pair":
+            displacement = teacher["displacement"]
+            if displacement.shape != scores.shape:
+                raise ValueError("Displacement shape must match scores.")
+
+            expected = torch.zeros_like(context["t"], dtype=torch.long)
+            expected[vertex] = delta
+
+            if teacher["move_type"] == "swap":
+                moved = torch.nonzero(
+                    displacement != 0, as_tuple=False
+                ).flatten().tolist()
+                partners = [index for index in moved if index != vertex]
+                if len(moved) != 2 or len(partners) != 1:
+                    raise ValueError("A swap must move exactly two vertices.")
+                partner = partners[0]
+                expected[partner] = -delta
+                signal[partner] = -score * delta
+
+            if not torch.equal(
+                displacement.to(device=expected.device), expected
+            ):
+                raise ValueError(
+                    "Realised displacement disagrees with selected move."
+                )
     else:
         displacement = teacher["displacement"]
         if displacement.shape != scores.shape:
@@ -1365,8 +1393,8 @@ class QiHOTOGL(nn.Module):
             raise ValueError("q_values must be distinct.")
         if moment_method not in ("exact", "monte_carlo"):
             raise ValueError("Unknown moment method.")
-        if backward_mode not in ("M0", "M1", "M2", "M3"):
-            raise ValueError("This version supports M0, M1, M2 and M3.")
+        if backward_mode not in ("M0", "M1", "M2", "M2-pair", "M3"):
+            raise ValueError("This version supports M0, M1, M2, M2-pair and M3.")
         if aggregation_fn != "mean":
             raise ValueError(
                 "This graph-moment version currently supports 'mean'."
@@ -1567,8 +1595,8 @@ class QiHOTOGL(nn.Module):
         All views/graphs are backpropagated together.
         """
         mode = self.backward_mode if mode is None else mode
-        if mode not in ("M0", "M1", "M2", "M3"):
-            raise ValueError("This version supports M0, M1, M2 and M3.")
+        if mode not in ("M0", "M1", "M2", "M2-pair", "M3"):
+            raise ValueError("This version supports M0, M1, M2, M2-pair and M3.")
 
         contexts = self._training_contexts
         if contexts is None:
