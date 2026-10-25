@@ -117,6 +117,142 @@ def fixed_random_filtration_scores(
     ).to(edge_index.device)
 
 
+@torch.no_grad()
+def prepare_degree_filtration(
+    edge_index, n_vertices, k, q_values, z_max, *,
+    moment_method="exact", n_samples=10000, seed=0,
+    batch_size=4096,
+):
+    """M5: raw simple-undirected degrees, without decoder or SELECT.
+
+    Row j (zero-based) represents degree threshold j, for j=0,...,k-1.
+    Equal-degree vertices enter simultaneously. All views use the same
+    degree filtration. Self-loops and duplicate edges do not affect degrees.
+    """
+    for name, value in (
+        ("n_vertices", n_vertices), ("k", k), ("z_max", z_max),
+        ("n_samples", n_samples), ("batch_size", batch_size),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(name + " must be a Python integer.")
+        if value < 1:
+            raise ValueError(name + " must be positive.")
+    if k < n_vertices:
+        raise ValueError("Every graph must satisfy n <= k.")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be a Python integer.")
+    if moment_method not in ("exact", "monte_carlo"):
+        raise ValueError("Unknown moment method.")
+
+    q_values = tuple(q_values)
+    if not q_values or len(set(q_values)) != len(q_values):
+        raise ValueError("Select nonempty, distinct simplex dimensions.")
+    for q in q_values:
+        if isinstance(q, bool) or not isinstance(q, int) or q < 0:
+            raise ValueError("Dimensions must be nonnegative integers.")
+
+    if (
+        not isinstance(edge_index, torch.Tensor)
+        or edge_index.ndim != 2 or edge_index.shape[0] != 2
+    ):
+        raise ValueError("edge_index must have shape [2, E].")
+    if edge_index.dtype != torch.long:
+        raise TypeError("edge_index must use torch.long.")
+    if edge_index.numel() and (
+        edge_index.min().item() < 0
+        or edge_index.max().item() >= n_vertices
+    ):
+        raise ValueError("Edge vertex index is out of range.")
+
+    device = edge_index.device
+    pairs = sorted({
+        (min(a, b), max(a, b))
+        for a, b in edge_index.cpu().t().tolist()
+        if a != b
+    })
+    degrees = torch.zeros(n_vertices, dtype=torch.long, device=device)
+    for a, b in pairs:
+        degrees[a] += 1
+        degrees[b] += 1
+
+    rows = {q: [] for q in q_values}
+    previous_active = None
+    previous_rows = None
+
+    for level in range(k):
+        active = tuple(
+            torch.nonzero(degrees <= level, as_tuple=False)
+            .flatten().cpu().tolist()
+        )
+        if active != previous_active:
+            if not active:
+                previous_rows = {
+                    q: torch.zeros(z_max, dtype=torch.float64, device=device)
+                    for q in q_values
+                }
+            else:
+                # Evaluate the induced complex of the active vertices.
+                # Ones below encode only this already-selected complex;
+                # the actual M5 filtration remains the raw degree vector.
+                mapping = {vertex: index for index, vertex in enumerate(active)}
+                directed = [
+                    edge
+                    for a, b in pairs if a in mapping and b in mapping
+                    for edge in (
+                        (mapping[a], mapping[b]), (mapping[b], mapping[a])
+                    )
+                ]
+                if directed:
+                    local_edges = torch.tensor(
+                        directed, dtype=torch.long, device=device
+                    ).t().contiguous()
+                else:
+                    local_edges = torch.empty(
+                        (2, 0), dtype=torch.long, device=device
+                    )
+                active_assignment = torch.ones(
+                    len(active), dtype=torch.long, device=device
+                )
+                previous_rows = {}
+                for q in q_values:
+                    if moment_method == "exact":
+                        row = exact_hodge_moments_at_level(
+                            local_edges, active_assignment, 1, q, z_max
+                        ).to(device)
+                    else:
+                        sparse = sparse_reflected_hodge_columns(
+                            local_edges, active_assignment, level=1, q=q
+                        )
+                        table = prepare_hodge_walk_table(
+                            sparse, device=device
+                        )
+                        row = estimate_hodge_walk_moments(
+                            table, z_max=z_max, n_samples=n_samples,
+                            seed=(seed + q * (k + 1) + level) % (2**63 - 1),
+                            batch_size=batch_size,
+                        )
+                    previous_rows[q] = row
+            previous_active = active
+
+        for q in q_values:
+            rows[q].append(previous_rows[q])
+
+    phi = torch.cat(
+        [torch.stack(rows[q]) for q in q_values], dim=1
+    ).to(device)
+
+    return {
+        "t": degrees,
+        "levels": torch.arange(k, device=device),
+        "k": k,
+        "q_values": q_values,
+        "z_max": z_max,
+        "phi": phi,
+        "moment_method": moment_method,
+        "fixed_degree_control": True,
+    }
+
+
 def validate_current_filtration(t, k):
     """Validate a current injective assignment and return sigma.
 
@@ -1188,13 +1324,16 @@ def filtration_surrogate_signal(
     """
     import math
 
-    if mode not in ("M0", "M1", "M2", "M2-pair", "M3", "M4"):
-        raise ValueError("mode must be 'M0', 'M1', 'M2', 'M2-pair', 'M3' or 'M4'.")
+    if mode not in ("M0", "M1", "M2", "M2-pair", "M3", "M4", "M5"):
+        raise ValueError("mode must be 'M0', 'M1', 'M2', 'M2-pair', 'M3', 'M4' or 'M5'.")
 
     if not isinstance(scores, torch.Tensor):
         raise TypeError("scores must be a torch.Tensor.")
     if scores.ndim != 1 or not scores.is_floating_point():
         raise ValueError("scores must be a floating-point vector.")
+    if mode == "M5":
+        return torch.zeros_like(scores)
+
     if mode == "M4":
         if (
             isinstance(m4_scale, bool)
@@ -1420,8 +1559,8 @@ class QiHOTOGL(nn.Module):
             raise ValueError("m4_scale must be finite and positive.")
         self.m4_scale = float(m4_scale)
 
-        if backward_mode not in ("M0", "M1", "M2", "M2-pair", "M3", "M4"):
-            raise ValueError("This version supports M0, M1, M2, M2-pair, M3 and M4.")
+        if backward_mode not in ("M0", "M1", "M2", "M2-pair", "M3", "M4", "M5"):
+            raise ValueError("This version supports M0, M1, M2, M2-pair, M3, M4 and M5.")
         if aggregation_fn != "mean":
             raise ValueError(
                 "This graph-moment version currently supports 'mean'."
@@ -1538,7 +1677,7 @@ class QiHOTOGL(nn.Module):
                 raise ValueError("Every graph must satisfy n <= k.")
 
         scores = (
-            None if self.backward_mode == "M0"
+            None if self.backward_mode in ("M0", "M5")
             else self.filtrations(x)
         )
         collect = self.training and torch.is_grad_enabled()
@@ -1566,7 +1705,9 @@ class QiHOTOGL(nn.Module):
             views = []
 
             for view in range(self.n_filtrations):
-                if self.backward_mode == "M0":
+                if self.backward_mode == "M5":
+                    view_scores = None
+                elif self.backward_mode == "M0":
                     view_scores = fixed_random_filtration_scores(
                         local_edges,
                         nodes.numel(),
@@ -1575,20 +1716,30 @@ class QiHOTOGL(nn.Module):
                     )
                 else:
                     view_scores = graph_scores[:, view]
-                context = prepare_filtration_teacher(
-                    view_scores,
-                    local_edges,
-                    self.k,
-                    self.q_values,
-                    self.z_max,
-                    decoder_mode=self.decoder_mode,
-                    tau=self.tau,
-                    moment_method=self.moment_method,
-                    n_samples=self.n_samples,
-                    seed=self.seed
-                    + graph_id * self.n_filtrations + view,
-                    batch_size=self.walk_batch_size,
-                )
+                if self.backward_mode == "M5":
+                    context = prepare_degree_filtration(
+                        local_edges, nodes.numel(), self.k,
+                        self.q_values, self.z_max,
+                        moment_method=self.moment_method,
+                        n_samples=self.n_samples,
+                        seed=self.seed,
+                        batch_size=self.walk_batch_size,
+                    )
+                else:
+                    context = prepare_filtration_teacher(
+                        view_scores,
+                        local_edges,
+                        self.k,
+                        self.q_values,
+                        self.z_max,
+                        decoder_mode=self.decoder_mode,
+                        tau=self.tau,
+                        moment_method=self.moment_method,
+                        n_samples=self.n_samples,
+                        seed=self.seed
+                        + graph_id * self.n_filtrations + view,
+                        batch_size=self.walk_batch_size,
+                    )
 
                 context["fixed_random_control"] = (
                     self.backward_mode == "M0"
@@ -1622,12 +1773,37 @@ class QiHOTOGL(nn.Module):
         All views/graphs are backpropagated together.
         """
         mode = self.backward_mode if mode is None else mode
-        if mode not in ("M0", "M1", "M2", "M2-pair", "M3", "M4"):
-            raise ValueError("This version supports M0, M1, M2, M2-pair, M3 and M4.")
+        if mode not in ("M0", "M1", "M2", "M2-pair", "M3", "M4", "M5"):
+            raise ValueError("This version supports M0, M1, M2, M2-pair, M3, M4 and M5.")
 
         contexts = self._training_contexts
         if contexts is None:
             raise RuntimeError("No pending training forward.")
+
+        if mode == "M5" or any(
+            context.get("fixed_degree_control", False)
+            for _, context in contexts
+        ):
+            if mode != "M5" or not all(
+                context.get("fixed_degree_control", False)
+                for _, context in contexts
+            ):
+                raise ValueError(
+                    "Choose M5 at construction, before the forward pass."
+                )
+            for _, context in contexts:
+                if context["phi"].grad is None:
+                    raise RuntimeError("Run classification backward first.")
+            events = [
+                {
+                    "selected": None,
+                    "fixed_degree_control": True,
+                    "filtration": context["t"].clone(),
+                }
+                for _, context in contexts
+            ]
+            self._training_contexts = None
+            return events
 
         if any(
             context["fixed_random_control"] != (mode == "M0")
