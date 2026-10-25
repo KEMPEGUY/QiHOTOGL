@@ -1657,7 +1657,7 @@ class TopoGCN(torch.nn.Module):
         return self.classifier(global_mean_pool(h, data.batch))
 
 
-def run_training_demo():
+def run_training_demo(model_seed=42, dataset_seed=1729, epochs=15):
     """Compare surrogate modes on six-node synthetic graphs."""
     import csv
     import json
@@ -1666,9 +1666,6 @@ def run_training_demo():
     from torch_geometric.data import Batch
 
     torch.set_num_threads(1)
-    dataset_seed = 1729
-    model_seed = 42
-    epochs = 15
     learning_rate = 0.01
     generator = torch.Generator().manual_seed(dataset_seed)
 
@@ -1841,6 +1838,7 @@ def run_training_demo():
             torch.save(model.state_dict(), directory / (mode + ".pt"))
 
     print("Results saved:", directory)
+    return directory
 
 
 if __name__ == "__main__":
