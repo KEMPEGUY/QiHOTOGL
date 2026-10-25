@@ -1167,10 +1167,15 @@ def single_step_filtration_teacher(context, gamma):
 
 @torch.no_grad()
 def filtration_surrogate_signal(
-    scores, context, teacher, mode="M3"
+    scores, context, teacher, mode="M3", *,
+    m1_alpha=10.0, m1_boundary_lambda=0.5,
 ):
     """Construct M0 zero credit or an experimental M2/M3 signal.
 
+    M1: historical SBG, -S * sigmoid(alpha * (scores - boundary)).
+        Boundary interpolates the selected score and directional neighbour;
+        a topmost increment uses the selected score as its boundary.
+        No direction multiplier, centering or auxiliary objective is added.
     M2: -S * direction * one_hot(selected_vertex).
     M3: -S * realised_displacement.
 
@@ -1179,8 +1184,8 @@ def filtration_surrogate_signal(
     """
     import math
 
-    if mode not in ("M0", "M2", "M3"):
-        raise ValueError("mode must be 'M0', 'M2' or 'M3'.")
+    if mode not in ("M0", "M1", "M2", "M3"):
+        raise ValueError("mode must be 'M0', 'M1', 'M2' or 'M3'.")
 
     if not isinstance(scores, torch.Tensor):
         raise TypeError("scores must be a torch.Tensor.")
@@ -1190,6 +1195,20 @@ def filtration_surrogate_signal(
         raise ValueError("scores and filtration sizes must match.")
     if not torch.isfinite(scores).all().item():
         raise ValueError("scores must be finite.")
+
+    if mode == "M1":
+        for name, value in (
+            ("m1_alpha", m1_alpha),
+            ("m1_boundary_lambda", m1_boundary_lambda),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(name + " must be a finite Python number.")
+            if not math.isfinite(value):
+                raise ValueError(name + " must be finite.")
+        if m1_alpha <= 0:
+            raise ValueError("m1_alpha must be positive.")
+        if not 0 <= m1_boundary_lambda <= 1:
+            raise ValueError("m1_boundary_lambda must lie in [0, 1].")
 
     signal = torch.zeros_like(scores)
     if mode == "M0":
@@ -1209,7 +1228,25 @@ def filtration_surrogate_signal(
     if not 1 <= m < scores.numel():
         raise ValueError("Selected rank must be movable.")
 
-    if mode == "M2":
+    if mode == "M1":
+        vertex = int(context["sigma"][m].item())
+        neighbour_rank = m - 1 if direction == "-" else m + 1
+
+        if neighbour_rank < scores.numel():
+            neighbour = int(context["sigma"][neighbour_rank].item())
+            boundary = (
+                (1.0 - m1_boundary_lambda) * scores[vertex]
+                + m1_boundary_lambda * scores[neighbour]
+            )
+        else:
+            # Explicit convention for a topmost increment.
+            boundary = scores[vertex]
+
+        signal = -score * torch.sigmoid(
+            m1_alpha * (scores - boundary)
+        )
+
+    elif mode == "M2":
         vertex = int(context["sigma"][m].item())
         delta = -1 if direction == "-" else 1
         signal[vertex] = -score * delta
@@ -1298,6 +1335,8 @@ class QiHOTOGL(nn.Module):
         n_samples=10000,
         seed=0,
         batch_size=4096,
+        m1_alpha=10.0,
+        m1_boundary_lambda=0.5,
     ):
         super().__init__()
 
@@ -1326,8 +1365,8 @@ class QiHOTOGL(nn.Module):
             raise ValueError("q_values must be distinct.")
         if moment_method not in ("exact", "monte_carlo"):
             raise ValueError("Unknown moment method.")
-        if backward_mode not in ("M0", "M2", "M3"):
-            raise ValueError("This version supports M0, M2 and M3.")
+        if backward_mode not in ("M0", "M1", "M2", "M3"):
+            raise ValueError("This version supports M0, M1, M2 and M3.")
         if aggregation_fn != "mean":
             raise ValueError(
                 "This graph-moment version currently supports 'mean'."
@@ -1352,6 +1391,23 @@ class QiHOTOGL(nn.Module):
         self.n_samples = n_samples
         self.seed = seed
         self.walk_batch_size = batch_size
+
+        import math
+        for name, value in (
+            ("m1_alpha", m1_alpha),
+            ("m1_boundary_lambda", m1_boundary_lambda),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(name + " must be a finite Python number.")
+            if not math.isfinite(value):
+                raise ValueError(name + " must be finite.")
+        if m1_alpha <= 0:
+            raise ValueError("m1_alpha must be positive.")
+        if not 0 <= m1_boundary_lambda <= 1:
+            raise ValueError("m1_boundary_lambda must lie in [0, 1].")
+
+        self.m1_alpha = float(m1_alpha)
+        self.m1_boundary_lambda = float(m1_boundary_lambda)
 
         self.filtrations = nn.Sequential(
             nn.Linear(n_features, hidden_dim),
@@ -1511,8 +1567,8 @@ class QiHOTOGL(nn.Module):
         All views/graphs are backpropagated together.
         """
         mode = self.backward_mode if mode is None else mode
-        if mode not in ("M0", "M2", "M3"):
-            raise ValueError("This version supports M0, M2 and M3.")
+        if mode not in ("M0", "M1", "M2", "M3"):
+            raise ValueError("This version supports M0, M1, M2 and M3.")
 
         contexts = self._training_contexts
         if contexts is None:
@@ -1564,7 +1620,9 @@ class QiHOTOGL(nn.Module):
             gamma = -context["phi"].grad.detach()
             teacher = single_step_filtration_teacher(context, gamma)
             signal = filtration_surrogate_signal(
-                scores, context, teacher, mode
+                scores, context, teacher, mode,
+                m1_alpha=self.m1_alpha,
+                m1_boundary_lambda=self.m1_boundary_lambda,
             )
             score_tensors.append(scores)
             signals.append(signal)
