@@ -8,6 +8,8 @@ Training uses classification backward followed by explicit M2/M3
 surrogate backward before one optimizer step. Teacher moves provide
 learning signals; they do not overwrite neural-decoded filtrations.
 Inference uses neural decoding without teacher selection.
+M0 instead decodes fixed random graph/view scores and bypasses the
+neural scorer and SELECT during both training and inference.
 
 Candidate moves currently use epsilon = 1. M2/M3 are surrogate rules,
 not exact derivatives of the hard decoder. Other backward modes remain
@@ -40,6 +42,79 @@ from torch_geometric.nn import global_mean_pool
 from torch_scatter import scatter
 
 from torch_topological.utils import pairwise
+
+
+@torch.no_grad()
+def fixed_random_filtration_scores(
+    edge_index, n_vertices, seed=0, view=0
+):
+    """Fixed random scores for one labelled graph/view.
+
+    Independent of embeddings, scorer weights and batch position.
+    The existing decoder supplies anchoring and injectivity.
+
+    Identical labelled graphs share the same scores for the same
+    seed and view. No permutation-equivariance guarantee is made
+    for an individual fixed random assignment.
+    """
+    import hashlib
+    import json
+
+    if (
+        isinstance(n_vertices, bool)
+        or not isinstance(n_vertices, int)
+        or n_vertices < 1
+    ):
+        raise ValueError("n_vertices must be a positive integer.")
+
+    for name, value in (("seed", seed), ("view", view)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(name + " must be a Python integer.")
+
+    if view < 0:
+        raise ValueError("view must be nonnegative.")
+
+    if (
+        not isinstance(edge_index, torch.Tensor)
+        or edge_index.ndim != 2
+        or edge_index.shape[0] != 2
+    ):
+        raise ValueError("edge_index must have shape [2, E].")
+
+    if edge_index.dtype != torch.long:
+        raise TypeError("edge_index must use torch.long.")
+
+    if edge_index.numel() and (
+        edge_index.min().item() < 0
+        or edge_index.max().item() >= n_vertices
+    ):
+        raise ValueError("Edge vertex index is out of range.")
+
+    # Match the simple-undirected clique-complex interpretation.
+    edges = sorted({
+        tuple(sorted((u, v)))
+        for u, v in edge_index.detach().cpu().t().tolist()
+        if u != v
+    })
+
+    payload = json.dumps(
+        [n_vertices, edges, seed, view],
+        separators=(",", ":"),
+    ).encode()
+
+    local_seed = (
+        int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+        % (2**63 - 1)
+    )
+
+    # Local generator: do not consume the global random stream.
+    generator = torch.Generator(device="cpu").manual_seed(local_seed)
+
+    return torch.rand(
+        n_vertices,
+        dtype=torch.float64,
+        generator=generator,
+    ).to(edge_index.device)
 
 
 def validate_current_filtration(t, k):
@@ -1094,7 +1169,7 @@ def single_step_filtration_teacher(context, gamma):
 def filtration_surrogate_signal(
     scores, context, teacher, mode="M3"
 ):
-    """Construct an experimental M2 or M3 score-gradient signal.
+    """Construct M0 zero credit or an experimental M2/M3 signal.
 
     M2: -S * direction * one_hot(selected_vertex).
     M3: -S * realised_displacement.
@@ -1104,8 +1179,8 @@ def filtration_surrogate_signal(
     """
     import math
 
-    if mode not in ("M2", "M3"):
-        raise ValueError("mode must be 'M2' or 'M3'.")
+    if mode not in ("M0", "M2", "M3"):
+        raise ValueError("mode must be 'M0', 'M2' or 'M3'.")
 
     if not isinstance(scores, torch.Tensor):
         raise TypeError("scores must be a torch.Tensor.")
@@ -1117,6 +1192,8 @@ def filtration_surrogate_signal(
         raise ValueError("scores must be finite.")
 
     signal = torch.zeros_like(scores)
+    if mode == "M0":
+        return signal
     selected = teacher["selected"]
 
     if selected is None:
@@ -1190,6 +1267,8 @@ class QiHOTOGL(nn.Module):
     """Experimental batched moment-based graph layer.
 
     Each graph/view produces an anchored hard filtration and moments.
+    M0 fixes random assignments and bypasses the scorer and SELECT.
+    M2/M3 retain their neural forward and surrogate backward.
     A graph-level correction is broadcast to its node embeddings.
 
     Training:
@@ -1247,8 +1326,8 @@ class QiHOTOGL(nn.Module):
             raise ValueError("q_values must be distinct.")
         if moment_method not in ("exact", "monte_carlo"):
             raise ValueError("Unknown moment method.")
-        if backward_mode not in ("M2", "M3"):
-            raise ValueError("This version supports M2 and M3.")
+        if backward_mode not in ("M0", "M2", "M3"):
+            raise ValueError("This version supports M0, M2 and M3.")
         if aggregation_fn != "mean":
             raise ValueError(
                 "This graph-moment version currently supports 'mean'."
@@ -1347,7 +1426,10 @@ class QiHOTOGL(nn.Module):
             if (batch == graph_id).sum().item() > self.k:
                 raise ValueError("Every graph must satisfy n <= k.")
 
-        scores = self.filtrations(x)
+        scores = (
+            None if self.backward_mode == "M0"
+            else self.filtrations(x)
+        )
         collect = self.training and torch.is_grad_enabled()
         contexts = []
         graph_features = []
@@ -1367,11 +1449,21 @@ class QiHOTOGL(nn.Module):
             )
             edge_mask = batch[edges[0]] == graph_id
             local_edges = mapping[edges[:, edge_mask]]
-            graph_scores = scores[nodes]
+            graph_scores = (
+                None if scores is None else scores[nodes]
+            )
             views = []
 
             for view in range(self.n_filtrations):
-                view_scores = graph_scores[:, view]
+                if self.backward_mode == "M0":
+                    view_scores = fixed_random_filtration_scores(
+                        local_edges,
+                        nodes.numel(),
+                        seed=self.seed,
+                        view=view,
+                    )
+                else:
+                    view_scores = graph_scores[:, view]
                 context = prepare_filtration_teacher(
                     view_scores,
                     local_edges,
@@ -1387,6 +1479,9 @@ class QiHOTOGL(nn.Module):
                     batch_size=self.walk_batch_size,
                 )
 
+                context["fixed_random_control"] = (
+                    self.backward_mode == "M0"
+                )
                 # Cast BEFORE making the classifier-input leaf.
                 phi = context["phi"].to(
                     device=x.device, dtype=x.dtype
@@ -1416,12 +1511,41 @@ class QiHOTOGL(nn.Module):
         All views/graphs are backpropagated together.
         """
         mode = self.backward_mode if mode is None else mode
-        if mode not in ("M2", "M3"):
-            raise ValueError("This version supports M2 and M3.")
+        if mode not in ("M0", "M2", "M3"):
+            raise ValueError("This version supports M0, M2 and M3.")
 
         contexts = self._training_contexts
         if contexts is None:
             raise RuntimeError("No pending training forward.")
+
+        if any(
+            context["fixed_random_control"] != (mode == "M0")
+            for _, context in contexts
+        ):
+            raise ValueError(
+                "Choose M0 at construction, before the forward pass."
+            )
+
+        if mode == "M0":
+            for _, context in contexts:
+                if context["phi"].grad is None:
+                    raise RuntimeError(
+                        "Run classification backward first."
+                    )
+
+            events = [
+                {
+                    "selected": None,
+                    "target_t": context["t"].clone(),
+                    "target_sigma": context["sigma"].clone(),
+                    "displacement": torch.zeros_like(context["t"]),
+                    "move_type": "none",
+                }
+                for _, context in contexts
+            ]
+
+            self._training_contexts = None
+            return events
 
         # Check all views before starting the second backward pass.
         for scores, context in contexts:
