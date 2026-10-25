@@ -1168,7 +1168,7 @@ def single_step_filtration_teacher(context, gamma):
 @torch.no_grad()
 def filtration_surrogate_signal(
     scores, context, teacher, mode="M3", *,
-    m1_alpha=10.0, m1_boundary_lambda=0.5,
+    m1_alpha=10.0, m1_boundary_lambda=0.5, m4_scale=1.0,
 ):
     """Construct M0 zero credit or an experimental M2/M3 signal.
 
@@ -1180,19 +1180,36 @@ def filtration_surrogate_signal(
     M2-pair: M2 credit on both swap vertices, with the same sign;
         direct moves retain ordinary M2 credit.
     M3: -S * realised_displacement.
+    M4: independent Gaussian noise scaled by fixed m4_scale;
+        bypasses SELECT and uses no filtration or task-derived credit.
 
     S is the positive provisional score returned by SELECT.
     This is a detached surrogate, not an exact decoder derivative.
     """
     import math
 
-    if mode not in ("M0", "M1", "M2", "M2-pair", "M3"):
-        raise ValueError("mode must be 'M0', 'M1', 'M2', 'M2-pair' or 'M3'.")
+    if mode not in ("M0", "M1", "M2", "M2-pair", "M3", "M4"):
+        raise ValueError("mode must be 'M0', 'M1', 'M2', 'M2-pair', 'M3' or 'M4'.")
 
     if not isinstance(scores, torch.Tensor):
         raise TypeError("scores must be a torch.Tensor.")
     if scores.ndim != 1 or not scores.is_floating_point():
         raise ValueError("scores must be a floating-point vector.")
+    if mode == "M4":
+        if (
+            isinstance(m4_scale, bool)
+            or not isinstance(m4_scale, (int, float))
+        ):
+            raise TypeError("m4_scale must be a finite Python number.")
+        if not math.isfinite(m4_scale) or m4_scale <= 0:
+            raise ValueError("m4_scale must be finite and positive.")
+        if not torch.isfinite(scores).all().item():
+            raise ValueError("scores must be finite.")
+        signal = m4_scale * torch.randn_like(scores)
+        if not torch.isfinite(signal).all().item():
+            raise ValueError("Random signal overflowed.")
+        return signal
+
     if scores.numel() != context["t"].numel():
         raise ValueError("scores and filtration sizes must match.")
     if not torch.isfinite(scores).all().item():
@@ -1364,7 +1381,7 @@ class QiHOTOGL(nn.Module):
         seed=0,
         batch_size=4096,
         m1_alpha=10.0,
-        m1_boundary_lambda=0.5,
+        m1_boundary_lambda=0.5, m4_scale=1.0,
     ):
         super().__init__()
 
@@ -1393,8 +1410,18 @@ class QiHOTOGL(nn.Module):
             raise ValueError("q_values must be distinct.")
         if moment_method not in ("exact", "monte_carlo"):
             raise ValueError("Unknown moment method.")
-        if backward_mode not in ("M0", "M1", "M2", "M2-pair", "M3"):
-            raise ValueError("This version supports M0, M1, M2, M2-pair and M3.")
+        import math
+        if (
+            isinstance(m4_scale, bool)
+            or not isinstance(m4_scale, (int, float))
+        ):
+            raise TypeError("m4_scale must be a finite Python number.")
+        if not math.isfinite(m4_scale) or m4_scale <= 0:
+            raise ValueError("m4_scale must be finite and positive.")
+        self.m4_scale = float(m4_scale)
+
+        if backward_mode not in ("M0", "M1", "M2", "M2-pair", "M3", "M4"):
+            raise ValueError("This version supports M0, M1, M2, M2-pair, M3 and M4.")
         if aggregation_fn != "mean":
             raise ValueError(
                 "This graph-moment version currently supports 'mean'."
@@ -1595,8 +1622,8 @@ class QiHOTOGL(nn.Module):
         All views/graphs are backpropagated together.
         """
         mode = self.backward_mode if mode is None else mode
-        if mode not in ("M0", "M1", "M2", "M2-pair", "M3"):
-            raise ValueError("This version supports M0, M1, M2, M2-pair and M3.")
+        if mode not in ("M0", "M1", "M2", "M2-pair", "M3", "M4"):
+            raise ValueError("This version supports M0, M1, M2, M2-pair, M3 and M4.")
 
         contexts = self._training_contexts
         if contexts is None:
@@ -1630,6 +1657,34 @@ class QiHOTOGL(nn.Module):
 
             self._training_contexts = None
             return events
+
+        if mode == "M4":
+            for scores, context in contexts:
+                if context["phi"].grad is None:
+                    raise RuntimeError(
+                        "Run loss.backward(retain_graph=True) first."
+                    )
+                if not scores.requires_grad:
+                    raise RuntimeError("Scorer outputs require gradients.")
+
+            score_tensors = [scores for scores, _ in contexts]
+            signals = [
+                filtration_surrogate_signal(
+                    scores, None, None,
+                    mode="M4", m4_scale=self.m4_scale,
+                )
+                for scores in score_tensors
+            ]
+            torch.autograd.backward(
+                score_tensors,
+                grad_tensors=signals,
+                retain_graph=retain_graph,
+            )
+            self._training_contexts = None
+            return [
+                {"selected": None, "random_backward_control": True}
+                for _ in score_tensors
+            ]
 
         # Check all views before starting the second backward pass.
         for scores, context in contexts:
