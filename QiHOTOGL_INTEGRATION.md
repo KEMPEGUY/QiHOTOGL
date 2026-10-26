@@ -1,6 +1,6 @@
 # QiHOTOGL integration
 
-Original plan: 22 October 2026  
+Original plan: 22 October 2026
 Updated: 26 October 2026
 
 The integration started from the simplified TOGL implementation in
