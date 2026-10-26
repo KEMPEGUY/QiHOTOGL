@@ -1,308 +1,358 @@
-# QiHOTOGL integration plan
+# QiHOTOGL integration
 
-Date: 22 October 2026
+Original plan: 22 October 2026  
+Updated: 26 October 2026
 
-Starting point: `torch_topological/nn/graphs.py` in this repository.
+The integration started from the simplified TOGL implementation in
+`torch_topological/nn/graphs.py`. QiHOTOGL is implemented separately in
+`torch_topological/nn/qihotogl.py`.
 
-## Purpose
+This document describes the current discrete implementation, the changes
+made to the original plan, and the work still to do.
 
-Identify where the QiHOTOGL layer will be integrated and which parts of
-the simplified TOGL implementation will be retained, replaced, or added.
+## 1. Architecture
 
-This is an implementation plan. The QiHOTOGL layer has not yet been coded
-or validated in this repository.
-
-## 1. Current and proposed computation
-
-The current model follows:
+The original TOGL pathway was:
 
 Node features → GCN → neural filtration scores → persistence pairs →
 DeepSet encoder → node residual → GCN → graph mean pooling.
 
-The proposed standalone QiHOTOGL model follows:
+The implemented QiHOTOGL pathway is:
 
-Node features → GCN feature extractor → neural filtration scores →
-SORT and hard decoding → Monte Carlo Hodge moment matrices →
-flatten and concatenate → graph classifier.
+Node features → first GCN → node embeddings H.
 
-The GCN feature extractor and filtration network together form the
-trainable scorer. The classifier uses one graph-classification loss.
+For each graph, a topology branch computes:
 
-## 2. Retain the neural scorer
+H → filtration construction → Hodge moment matrices →
+flatten and concatenate → moment projector → graph correction c.
 
-Location: `TOGL.__init__`, attribute `self.filtrations`.
+The correction is added to every node embedding in that graph:
 
-The existing scorer is:
+    H'_v = H_v + c
+
+Classification then follows:
+
+H' → second GCN → graph mean pooling → linear classifier.
+
+This differs from the original standalone plan, which fed the flattened
+moment matrices directly to a graph classifier. The implemented model
+retains a node residual and a downstream GCN, but replaces persistence
+features with projected moment features.
+
+The persistence-specific DeepSet encoder is not used in the QiHOTOGL
+pathway. The original TOGL implementation remains a separate reference.
+
+## 2. Neural filtration scorer
+
+The neural scorer retains the structure:
 
     Linear(n_features, hidden_dim)
     ReLU()
     Linear(hidden_dim, n_filtrations)
 
-Retain this structure to produce R scores per vertex, where
-R = n_filtrations.
+It produces R scores per vertex:
 
-Keep R configurable. The existing example uses 16 filtration views.
+    scores.shape = [N_batch, R]
 
-The scorer output has shape:
+Here, N_batch is the total number of vertices in the graph batch.
+Scoring and decoding are separated by graph and view.
 
-    [N_batch, R]
+M1, M2, M2-pair, M3 and M4 use this neural scorer.
+M0 and M5 bypass it.
 
-N_batch is the total number of vertices in the current graph batch.
+The preceding GCN supplies the scorer's inputs. Its parameters can
+receive both ordinary classification gradients through the residual
+path and additional credit through the neural scorer.
 
-## 3. Insert SORT and hard decoding
+## 3. Discrete decoding
 
-Insertion point: immediately after the existing call:
-
-    filtered_v = self.filtrations(x)
-
-For each graph and filtration view:
-
-1. Sort its vertex scores using a fixed ranking and tie-breaking convention.
-2. Decode an injective integer filtration t.
-3. Return the ordering permutation sigma.
-
-The decoded state must satisfy:
+For each graph and neural filtration view, the decoder sorts scores
+and constructs an anchored, injective integer assignment:
 
     1 = t[sigma[0]] < ... < t[sigma[n-1]] <= k
 
-Decoding is performed separately for each graph, not across all vertices
-in the batch.
+The decoder requires k >= n, where n is the graph's vertex count.
+It operates within each graph, never across the whole batch.
 
-The lower-star rule remains:
+Two decoding modes are available:
+
+- Rank decoding assigns consecutive levels according to sorted order.
+- Score-gap decoding uses sorted score differences to allocate additional
+  integer gaps when k > n.
+
+The ordering permutation sigma records original vertex indices in
+increasing filtration order. Sorting ties are resolved deterministically.
+
+M0 applies the decoder to fixed random scores.
+M5 uses raw degrees and does not apply this decoder.
+
+## 4. Complexes and Hodge moments
+
+The vertex assignment extends to each simplex by the lower-star rule:
 
     simplex_level = max(t[v] for v in simplex)
 
-The allocation of levels when k > n must be specified before implementing
-the decoder.
+At each evaluation level, the active vertices induce a subgraph and
+its clique complex.
 
-## 4. Replace persistent homology with Hodge moments
-
-Locations:
-
-- `TOGL.compute_persistent_homology`
-- `TOGL._compute_persistent_homology`
-
-Replace the persistence-pair computation with:
-
-1. Construction of the graph's clique complex.
-2. Assignment of simplex levels from the decoded vertex filtration.
-3. Construction or application of the required Hodge operators.
-4. Monte Carlo estimation of normalized spectral moments at each level.
-5. Assembly of moment matrices for each graph, view, and selected dimension.
-
-The following persistence-specific operations are not required in the
-QiHOTOGL pathway:
-
-- `st.persistence()`
-- `st.lower_star_persistence_generators()`
-- Persistence-generator indexing.
-- Birth–death pair construction.
-- The `persistence_diagrams` tensor.
-
-GUDHI may still be used for complex construction; removing persistence
-does not require removing the complex-construction library.
-
-## 5. Make Hodge dimensions configurable
-
-Add a user parameter such as:
-
-    q_values = (0, 3)
-
-Other examples include:
-
-    q_values = (2,)
-    q_values = (0, 1, 2, 3)
-
-Validate the selection and use a consistent ordering of dimensions.
-
-Derive:
-
-    q_max = max(q_values)
-
-The full q-Hodge Laplacian contains both boundary contributions:
+The q-Hodge Laplacian includes both boundary contributions:
 
     Delta_q = B_q.T @ B_q + B_(q+1) @ B_(q+1).T
 
-Therefore, the construction corresponding to `st.expansion(2)` must
-support simplices through dimension q_max + 1.
+Computing dimension q therefore requires simplices through dimension
+q + 1 when those simplices exist.
 
-Only dimensions explicitly selected in q_values contribute moment blocks
-and candidate-score contributions. Intermediate simplices are constructed
-where required for those operators.
+For a nonempty active q-chain space, the current normalization is:
 
-## 6. Replace the persistence encoder and node residual
+    H_q = I - Delta_q / n_active
+    M_q(z) = trace(H_q ** z) / d_q
 
-Locations:
+Here, n_active is the number of active vertices, d_q is the number
+of active q-simplices, and the power is a matrix power.
+Empty q-chain spaces receive zero moment vectors.
 
-- Class `DeepSetLayer`
-- `TOGL.__init__`: `self.set_fn` and `self.batch_norm`
-- `TOGL.forward`: persistence reshape, encoder loop, and residual addition
+Both exact and Monte Carlo moment computation are available.
+The exact computation serves as a reference for the Monte Carlo
+estimator and for small-graph experiments.
 
-The existing representation contains two persistence coordinates per
-vertex and view:
+The QiHOTOGL pathway does not construct persistence pairs or use
+persistence-generator indices.
 
-    [R, N_batch, 2]
+## 5. Dimensions, views and feature size
 
-The encoder reshapes this into node features and returns a node correction.
+The selected Hodge dimensions are controlled by q_values.
+Only selected dimensions contribute feature blocks and SELECT scores.
+Other simplex dimensions are constructed when needed by their operators.
 
-For standalone QiHOTOGL, replace that pathway with moment blocks:
+The number of views R, maximum filtration level k and maximum moment
+order z_max are configurable.
 
-    [B_batch, R, len(q_values), k, z_max]
-
-Flatten and concatenate the blocks for each graph:
-
-    [B_batch, R * len(q_values) * k * z_max]
-
-The DeepSet persistence encoder and its node residual are not used in this
-standalone architecture.
-
-## 7. Adapt the surrounding model
-
-Location: `TopoGCN.__init__` and `TopoGCN.forward`.
-
-Retain the first GCN as a feature extractor feeding the filtration scorer.
-
-Replace the connection:
-
-    TOGL → second GCN → node mean pooling
-
-with:
-
-    QiHOTOGL moment representation → graph classifier
-
-The classifier input width is derived from:
+Each graph contributes:
 
     R * len(q_values) * k * z_max
 
-The classifier outputs:
+moment features.
 
-    [B_batch, num_classes]
+These are flattened and concatenated before projection to the node
+embedding width. The resulting correction is broadcast to every node
+of the graph.
 
-This surrounding-model change is necessary because the existing TOGL
-returns node features, whereas standalone QiHOTOGL produces graph features.
+Recent experiments use:
 
-## 8. Add the configurable backward connection
+    R = 2
+    q_values = (0, 1, 2)
+    z_max = 4
 
-The classification objective is:
+They replace the moment projector's activation with LeakyReLU(0.01)
+inside the experiment script. This replacement is separate from the
+filtration scorer's ReLU.
 
-    L = CrossEntropy(logits, labels)
+M5 retains k rows, evaluated at degree thresholds 0, ..., k - 1.
+Neural-decoded filtrations and M0 use levels 1, ..., k.
 
-Obtain ordinary classification-loss gradients with respect to the moment
-matrices and classifier parameters.
+## 6. Classification and backward
 
-A configurable backward operator then constructs the score-space signal.
-Propagate that signal through the differentiable scorer using a
-vector–Jacobian product.
+Training uses one graph-classification objective:
 
-There is no auxiliary filtration loss.
+    loss = CrossEntropy(logits, labels)
 
-### SELECT-based methods: M1, M2, M3
+There is no auxiliary filtration loss and no teacher-student objective.
 
-For each graph and view:
+Classification backward trains the projector, classifier and surrounding
+GNN layers. Computed moments are used as gradient-enabled leaves, allowing
+the loss gradient with respect to the moment features to be collected.
 
-1. Apply Algorithm 1 to all admissible provisional unit directions.
-2. Sum score contributions over the selected Hodge dimensions.
-3. Select the best strictly positive score.
-4. Break ties by smallest vertex rank, then decrement before increment.
-5. Apply Algorithm 2 to construct one direct move or adjacent swap.
-6. Convert the selection information into the configured backward signal.
+The hard decoding and complex construction do not provide ordinary
+autograd derivatives to the neural scores. A separate backward rule
+supplies score-space credit:
 
-Use one iteration per graph/view/training step, initially with unit
-filtration steps.
+    g_theta = J_theta.T @ g_s
 
-If no candidate has a positive score, return zero surrogate credit.
+where J_theta is the Jacobian of the neural scores with respect to the
+scorer parameters.
 
-Keep separate:
+When the neural scorer shares the first GCN's computation, classification
+backward retains that graph for the subsequent surrogate backward.
+Both backward passes are completed before one optimizer step.
 
-- Selected vertex rank.
-- Selected vertex index.
-- Direction.
-- Affected moment-row level.
-- Provisional candidate score.
-- Realization type: direct or swap.
-- Swap partner, if present.
-- Realized filtration displacement.
+The training pattern is:
 
-Provisional scoring allows ties. Algorithm 2 restores injectivity through
-a direct update or adjacent swap. A swap changes two vertex assignments
-but at most one moment row per selected Hodge dimension.
+    optimizer.zero_grad(set_to_none=True)
+    logits = model(batch)
+    loss = CrossEntropy(logits, batch.y)
+    loss.backward(retain_graph=True)
+    events = model.topology.backward_surrogate()
+    optimizer.step()
 
-The provisional score need not equal the score of the realized swap.
+Training contexts are cleared after surrogate backward.
+Inference does not run SELECT or surrogate backward.
 
-The selected candidate supplies a learning signal. It does not permanently
-overwrite the forward filtration. After the optimizer update, compute new
-scores and decode again.
+## 7. SELECT and realization
 
-### Experimental modes
+M1, M2, M2-pair and M3 use one SELECT iteration per graph/view
+per training step.
 
-| Mode | Role |
-| --- | --- |
-| M0 | Frozen randomly initialized scorer; classifier learning only. |
-| M1 | SELECT with soft-boundary credit. |
-| M2 | SELECT with selected-index credit. |
-| M3 | SELECT with task-weighted displacement credit. |
-| M4 | Independent random score-space signal. |
-| M5 | Fixed degree-based scores followed by hard decoding. |
+The procedure:
 
-M0 and M5 are filtration controls. M4 is a random backward control.
-They do not require Algorithms 1–2.
+1. Obtains the negative classification gradient at the moment features.
+2. Scores admissible provisional unit increments and decrements.
+3. Sums contributions over the selected Hodge dimensions.
+4. Selects the largest strictly positive score.
+5. Breaks ties by smallest sorted vertex rank, then decrement before
+   increment.
+6. Realizes the direction as a direct move or an adjacent swap.
+7. Constructs the configured score-space signal.
 
-For M0, freeze the entire score-producing pathway and control stochastic
-layers so that its filtration remains fixed for a fixed input.
+Provisional proposals may contain ties. Realization preserves an
+injective current-filtration target and protects the anchored vertex.
 
-For M5, repeated identical degree views are not distinct learned views.
+The provisional score and the realized swap's moment response are
+different quantities. A positive provisional score does not guarantee
+that the realized swap decreases the classification loss.
 
-At inference, use score construction, hard decoding, moment estimation,
-and classification only. No SELECT or surrogate backward is required.
+The target is temporary. It supplies backward credit and does not
+overwrite the next forward filtration. After the optimizer step,
+the network produces new scores and the decoder is applied again.
 
-## 9. Separate the example and training code
+A selected event does not necessarily produce a change in the next
+decoded filtration.
 
-Location: the demonstration beginning with `B = 64`.
+## 8. Implemented conditions
 
-Move example execution out of the layer module and into a separate script.
+Seven conditions are selectable through backward_mode:
 
-Add:
+| Mode | Forward filtration | Scorer credit |
+| --- | --- | --- |
+| M0 | Fixed random graph/view scores followed by decoding | None |
+| M1 | Neural scores followed by decoding | Soft-boundary credit |
+| M2 | Neural scores followed by decoding | Selected-vertex directional credit |
+| M2-pair | Neural scores followed by decoding | Same-sign pair credit for swaps |
+| M3 | Neural scores followed by decoding | Realized-displacement credit |
+| M4 | Neural scores followed by decoding | Independent Gaussian noise |
+| M5 | Raw graph degrees; ties allowed | None |
 
-- Graph labels and train/validation/test splits.
-- Classification loss and optimizer.
-- The configured backward connection.
-- Reproducible random seeds.
-- Separate counts of direct moves and swaps.
-- Actual filtration-change and selected-target realization diagnostics.
+For the SELECT-based rules, let S_star be the selected positive
+provisional score, i the selected original vertex index, delta the
+direction (-1 earlier, +1 later), and d_star = target_t - t.
 
-The current demonstration performs forward calls only. It does not train
-the model.
+The implemented signals are:
 
-## 10. Implementation organization
+    M1:
+        g_s = -S_star * sigmoid(alpha * (scores - boundary))
 
-Implement the new QiHOTOGL layer separately, for example in:
+    M2:
+        g_s = -S_star * delta * e_i
 
-    torch_topological/nn/qihotogl.py
+    M2-pair, swap:
+        g_s = -S_star * delta * (e_i + e_j)
 
-Separate responsibilities for:
+    M2-pair, direct move:
+        same as M2
 
-- Hard decoding.
-- Complex and Hodge operations.
-- Monte Carlo moment estimation.
-- Direction selection and realization.
-- Configurable backward rules.
+    M3:
+        g_s = -S_star * d_star
 
-Retain the original TOGL source as a comparison reference; it is not part
-of the standalone QiHOTOGL forward pathway.
+    M4:
+        g_s = m4_scale * standard_normal_noise
 
-Check package exports when adding the new layer.
+M1 interpolates its boundary between the selected score and its
+directional neighbour. For a topmost increment, the boundary is the
+selected score. It does not include a direction multiplier.
 
-## 11. Details to finalize during implementation
+M1, M2, M2-pair and M3 return zero credit when no positive candidate
+is selected.
 
-- Decoder ranking, deterministic ties, and level allocation for k > n.
-- Monte Carlo walk estimator and sampling controls.
-- Hodge normalization and empty-chain convention.
-- Exact M1 and M2 credit formulas.
-- Backward scaling and sign conventions.
-- Dependency versions and device/batching behavior.
+M4 does not use SELECT, the selected target or the classification
+moment-gradient values to construct its random signal.
 
-The decoder's reachable assignments must be checked against the selected
-direct-move and swap targets.
+M0 generates reproducible random scores from the labelled graph,
+seed and view. The actual assignment is independent of embeddings,
+scorer weights and batch position. Identical labelled graphs share
+the same random scores for the same seed and view. An individual
+assignment is not guaranteed to be equivariant under vertex relabelling.
 
-These implementation details do not change the integration points
-identified above.
+M5 assigns:
+
+    t_i = degree_G(v_i)
+
+Degrees are taken from the simple undirected graph. Duplicate edges
+and self-loops do not alter them. No ranking, integer decoder or SELECT
+is used. Repeated degree views are identical.
+
+M0 and M5 bypass scorer backward. The surrounding network still trains.
+
+## 9. Tests and experiments
+
+The reported QiHOTOGL regression suite passed 152 tests after M5
+was added. Coverage includes decoding, selection, realization,
+moments, surrogate formulas, batched layer behavior and shared-backbone
+gradient accumulation.
+
+Tests for the added controls check fixed assignments, scorer bypass,
+random credit and exact/Monte Carlo integration.
+
+Separate audits have checked:
+
+- Nonzero moment gradients.
+- Score-space signal routing.
+- Scorer gradients against reference calculations.
+- Optimizer parameter updates.
+- Filtration changes after updates.
+- Differences between provisional and realized moment responses.
+- Decoder boundaries and repeated-update behavior.
+
+These checks establish implementation behavior. They do not establish
+that every update realizes the selected target or improves classification.
+
+Classification experiments have compared all seven conditions and a
+three-layer GCN baseline on small synthetic datasets. Recent comparisons
+used exact moments and one seed.
+
+On the marked four-cycle diagnostic, all five neural-score conditions,
+including random-backward M4, reached 100% test accuracy. M0, M5 and
+the tested GCN baseline remained at 50%.
+
+This result supports the usefulness of the neural-filtration architecture
+on that diagnostic, but does not isolate the benefit of SELECT-based
+credit. The models were not parameter-matched.
+
+## 10. Changes from the original plan
+
+Three changes should be kept explicit:
+
+1. The implemented architecture projects moments back to node embeddings
+   and retains a downstream GCN, rather than using only a standalone
+   moment classifier.
+2. M0 uses fixed random graph/view scores instead of freezing a neural
+   score-producing pathway.
+3. M5 uses raw degree filtrations with ties, rather than decoded degree
+   rankings.
+
+M2-pair was added as a further backward experiment.
+
+External training and audit scripts are available, but a training demo
+also remains in the layer module. Moving that demo out is still cleanup
+work.
+
+## 11. Remaining work
+
+- Add a control with the same neural forward construction but no injected
+  scorer credit. Frozen scorer weights alone do not fix its filtration
+  when the preceding GCN changes.
+- Record actual filtration and moment changes alongside selection counts
+  in the classification experiments.
+- Report direct moves, swaps and realized-response alignment separately.
+- Repeat comparisons across seeds and broader datasets.
+- Evaluate classification training with Monte Carlo moments and report
+  its variability against the exact reference.
+- Check supported devices, dependencies, package exports and dimensions
+  beyond those exercised in the current experiments.
+- Move executable demonstration code out of the layer module.
+- Keep the paper's architecture description consistent with the evaluated
+  model.
+
+A real-valued fine-grid filtration has also been discussed. It would
+remove integer decoding when raw neural outputs are used directly,
+while retaining finite-grid moment evaluation and an adapted surrogate
+backward. It remains an extension to implement and test, not part of the
+validated discrete pathway described above.
