@@ -28,7 +28,6 @@ Original TOGL reference:
 import torch
 import torch.nn as nn
 
-import gudhi as gd
 
 from torch_geometric.data import Data
 
@@ -995,21 +994,31 @@ def estimate_hodge_walk_moments(
                 generator=generator,
             )
 
-            # Sample within each column's own CDF.
-            for state in torch.unique(previous).tolist():
-                mask = previous == state
-                lo = int(offsets[state].item())
-                hi = int(offsets[state + 1].item())
+            # Vectorized binary search in each walker's column CDF.
+            # Each walker keeps its own sparse-column search bounds.
+            column_start = offsets[previous]
+            column_end = offsets[previous + 1]
+            left = column_start.clone()
+            right = column_end.clone()
 
-                local_cdf = cdf[lo:hi]
-                chosen = torch.searchsorted(
-                    local_cdf, uniforms[mask], right=True
+            while (left < right).any().item():
+                active = left < right
+                middle = left + (right - left) // 2
+
+                # Completed searches may point just beyond their column.
+                # Clamp only the lookup; completed bounds stay unchanged.
+                lookup = torch.minimum(middle, column_end - 1)
+                go_right = active & (cdf[lookup] <= uniforms)
+
+                left = torch.where(go_right, middle + 1, left)
+                right = torch.where(
+                    active & ~go_right, middle, right
                 )
-                chosen = chosen.clamp(max=hi - lo - 1)
-                positions = lo + chosen
 
-                next_states[mask] = destinations[positions]
-                product[mask] *= norms[state] * signs[positions]
+            # Match searchsorted(..., right=True) followed by clamping.
+            positions = torch.minimum(left, column_end - 1)
+            next_states = destinations[positions]
+            product *= norms[previous] * signs[positions]
 
             current = next_states
 
@@ -1448,40 +1457,6 @@ def filtration_surrogate_signal(
     return signal
 
 
-class DeepSetLayer(nn.Module):
-    """Simple equivariant deep set layer."""
-
-    def __init__(self, dim_in, dim_out, aggregation_fn):
-        """Create new deep set layer.
-
-        Parameters
-        ----------
-        dim_in : int
-            Input dimension
-
-        dim_out : int
-            Output dimension
-
-        aggregation_fn : str
-            Aggregation to use for the reduction step. Must be valid for
-            the ``torch_scatter.scatter()`` function, i.e. one of "sum",
-            "mul", "mean", "min" or "max".
-        """
-        super().__init__()
-
-        self.Gamma = nn.Linear(dim_in, dim_out)
-        self.Lambda = nn.Linear(dim_in, dim_out, bias=False)
-
-        self.aggregation_fn = aggregation_fn
-
-    def forward(self, x, batch):
-        """Implement forward pass through layer."""
-        xm = scatter(x, batch, dim=0, reduce=self.aggregation_fn)
-        xm = self.Lambda(xm)
-
-        x = self.Gamma(x)
-        x = x - xm[batch, :]
-        return x
 
 
 class QiHOTOGL(nn.Module):
