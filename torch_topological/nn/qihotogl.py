@@ -1508,8 +1508,8 @@ class QiHOTOGL(nn.Module):
         batch_size=4096,
         m1_alpha=10.0,
         m1_boundary_lambda=0.5, m4_scale=1.0,
-        scorer_activation="relu",
-        projector_activation="relu",
+        scorer_activation="leaky_relu",
+        projector_activation="leaky_relu",
     ):
         super().__init__()
 
