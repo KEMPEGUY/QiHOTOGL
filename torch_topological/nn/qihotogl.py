@@ -1459,6 +1459,18 @@ def filtration_surrogate_signal(
 
 
 
+
+def make_activation(name):
+    """Create a fresh activation module."""
+    if name == "relu":
+        return nn.ReLU()
+    if name == "leaky_relu":
+        return nn.LeakyReLU(negative_slope=0.01)
+    raise ValueError(
+        "activation must be 'relu' or 'leaky_relu'"
+    )
+
+
 class QiHOTOGL(nn.Module):
     """Experimental batched moment-based graph layer.
 
@@ -1496,6 +1508,8 @@ class QiHOTOGL(nn.Module):
         batch_size=4096,
         m1_alpha=10.0,
         m1_boundary_lambda=0.5, m4_scale=1.0,
+        scorer_activation="relu",
+        projector_activation="relu",
     ):
         super().__init__()
 
@@ -1578,9 +1592,12 @@ class QiHOTOGL(nn.Module):
         self.m1_alpha = float(m1_alpha)
         self.m1_boundary_lambda = float(m1_boundary_lambda)
 
+        self.scorer_activation = scorer_activation
+        self.projector_activation = projector_activation
+
         self.filtrations = nn.Sequential(
             nn.Linear(n_features, hidden_dim),
-            nn.ReLU(),
+            make_activation(scorer_activation),
             nn.Linear(hidden_dim, n_filtrations),
         )
 
@@ -1589,7 +1606,7 @@ class QiHOTOGL(nn.Module):
         )
         self.moment_projector = nn.Sequential(
             nn.Linear(feature_count, out_dim),
-            nn.ReLU(),
+            make_activation(projector_activation),
             nn.Linear(out_dim, n_features),
         )
 
