@@ -1877,7 +1877,11 @@ class QiHOTOGL(nn.Module):
             )
             score_tensors.append(scores)
             signals.append(signal)
-            events.append(teacher)
+
+            # Diagnostic copy only; the backward signal is unchanged.
+            event = dict(teacher)
+            event["surrogate_signal"] = signal.detach().clone()
+            events.append(event)
 
         torch.autograd.backward(
             score_tensors,
