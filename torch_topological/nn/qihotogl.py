@@ -1733,6 +1733,11 @@ class QiHOTOGL(nn.Module):
                         batch_size=self.walk_batch_size,
                     )
 
+                # Identify this graph/view within the current batch.
+                context["graph_id"] = graph_id
+                context["view_id"] = view
+                context["batch_node_indices"] = nodes.detach().clone()
+
                 context["fixed_random_control"] = (
                     self.backward_mode == "M0"
                 )
@@ -1881,6 +1886,43 @@ class QiHOTOGL(nn.Module):
             # Diagnostic copy only; the backward signal is unchanged.
             event = dict(teacher)
             event["surrogate_signal"] = signal.detach().clone()
+            event["graph_id"] = context["graph_id"]
+            event["view_id"] = context["view_id"]
+            event["selected_vertex"] = None
+            event["selected_batch_vertex"] = None
+            event["swap_partner"] = None
+            event["swap_partner_batch_vertex"] = None
+            event["affected_threshold"] = None
+            event["affected_row_index"] = None
+
+            if teacher["selected"] is not None:
+                rank, direction, _ = teacher["selected"]
+                vertex = int(context["sigma"][rank].item())
+                level = int(context["t"][vertex].item())
+                threshold = level if direction == "+" else level - 1
+
+                event["selected_vertex"] = vertex
+                event["selected_batch_vertex"] = int(
+                    context["batch_node_indices"][vertex].item()
+                )
+                event["affected_threshold"] = threshold
+                event["affected_row_index"] = threshold - 1
+
+                if teacher["move_type"] == "swap":
+                    moved = torch.nonzero(
+                        teacher["displacement"] != 0,
+                        as_tuple=False,
+                    ).flatten().tolist()
+                    partners = [v for v in moved if v != vertex]
+                    if len(moved) != 2 or len(partners) != 1:
+                        raise RuntimeError("Invalid swap displacement.")
+
+                    partner = partners[0]
+                    event["swap_partner"] = partner
+                    event["swap_partner_batch_vertex"] = int(
+                        context["batch_node_indices"][partner].item()
+                    )
+
             events.append(event)
 
         torch.autograd.backward(
