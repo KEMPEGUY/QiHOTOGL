@@ -11,9 +11,7 @@ Inference uses neural decoding without teacher selection.
 M0 instead decodes fixed random graph/view scores and bypasses the
 neural scorer and SELECT during both training and inference.
 
-One fixed epsilon sets physical grid spacing and move size. Exact integer
-indices are retained internally; physical values are epsilon times indices.
-M2/M3 are surrogate rules,
+Candidate moves currently use epsilon = 1. M2/M3 are surrogate rules,
 not exact derivatives of the hard decoder. Other backward modes remain
 pending. Exact moments use dense reference calculations for small graphs.
 
@@ -118,81 +116,11 @@ def fixed_random_filtration_scores(
     ).to(edge_index.device)
 
 
-def validate_filtration_epsilon(epsilon):
-    """Validate the one physical grid spacing, independent of optimizer LR."""
-    import math
-    if isinstance(epsilon, bool) or not isinstance(epsilon, (int, float)):
-        raise TypeError("epsilon must be a Python number.")
-    epsilon = float(epsilon)
-    if not math.isfinite(epsilon) or epsilon <= 0:
-        raise ValueError("epsilon must be finite and positive.")
-    return epsilon
-
-
-def filtration_values_from_levels(levels, epsilon=1.0):
-    """Map exact internal indices ell to physical values epsilon * ell.
-
-    Input remains integer. Output is float64, detached, on the same device.
-    Zero indices are permitted for the existing degree control (M5).
-    This is shared-grid rescaling, not continuous off-grid decoding.
-    """
-    epsilon = validate_filtration_epsilon(epsilon)
-    if not isinstance(levels, torch.Tensor):
-        raise TypeError("levels must be a torch.Tensor.")
-    if levels.dtype not in (
-        torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8,
-    ):
-        raise TypeError("levels must have an integer dtype.")
-    if levels.ndim != 1 or levels.numel() == 0:
-        raise ValueError("levels must be a nonempty vector.")
-    if (levels < 0).any().item():
-        raise ValueError("levels must be nonnegative.")
-    values = levels.to(dtype=torch.float64) * epsilon
-    if not torch.isfinite(values).all().item():
-        raise ValueError("Physical filtration values overflow float64.")
-    ordered = torch.sort(torch.unique(levels)).values
-    physical = ordered.to(dtype=torch.float64) * epsilon
-    if physical.numel() > 1 and not (physical[1:] > physical[:-1]).all().item():
-        raise ValueError("epsilon/levels cannot preserve distinct values in float64.")
-    return values
-
-
-def filtration_grid_thresholds(k, epsilon=1.0, *, device="cpu", start=1):
-    """Return k thresholds: epsilon,...,k*epsilon (start=0 for M5)."""
-    if isinstance(k, bool) or not isinstance(k, int) or k < 1:
-        raise ValueError("k must be a positive Python integer.")
-    if isinstance(start, bool) or start not in (0, 1):
-        raise ValueError("start must be 0 or 1.")
-    indices = torch.arange(start, start + k, device=device, dtype=torch.long)
-    return filtration_values_from_levels(indices, epsilon)
-
-
-def _with_filtration_grid(context, epsilon):
-    """Expose physical values without using floats as matrix-row indices.
-
-    context['t'] and teacher['displacement'] KEEP their existing integer
-    units. SELECT and all existing surrogate signals are unchanged.
-    In particular M3 uses displacement in grid steps, i.e. physical
-    displacement / epsilon. This prevents an unintended LR rescaling.
-    """
-    epsilon = validate_filtration_epsilon(epsilon)
-    context["epsilon"] = epsilon
-    context["level_indices"] = context["t"].clone()
-    context["filtration_values"] = filtration_values_from_levels(
-        context["t"], epsilon
-    )
-    context["thresholds"] = filtration_grid_thresholds(
-        context["k"], epsilon, device=context["t"].device,
-        start=0 if context.get("fixed_degree_control", False) else 1,
-    )
-    return context
-
-
 @torch.no_grad()
 def prepare_degree_filtration(
     edge_index, n_vertices, k, q_values, z_max, *,
     moment_method="exact", n_samples=10000, seed=0,
-    batch_size=4096, epsilon=1.0,
+    batch_size=4096,
 ):
     """M5: raw simple-undirected degrees, without decoder or SELECT.
 
@@ -200,7 +128,6 @@ def prepare_degree_filtration(
     Equal-degree vertices enter simultaneously. All views use the same
     degree filtration. Self-loops and duplicate edges do not affect degrees.
     """
-    epsilon = validate_filtration_epsilon(epsilon)
     for name, value in (
         ("n_vertices", n_vertices), ("k", k), ("z_max", z_max),
         ("n_samples", n_samples), ("batch_size", batch_size),
@@ -313,7 +240,7 @@ def prepare_degree_filtration(
         [torch.stack(rows[q]) for q in q_values], dim=1
     ).to(device)
 
-    return _with_filtration_grid({
+    return {
         "t": degrees,
         "levels": torch.arange(k, device=device),
         "k": k,
@@ -322,7 +249,7 @@ def prepare_degree_filtration(
         "phi": phi,
         "moment_method": moment_method,
         "fixed_degree_control": True,
-    }, epsilon)
+    }
 
 
 def validate_current_filtration(t, k):
@@ -371,8 +298,8 @@ def validate_current_filtration(t, k):
 def realise_filtration_direction(t, sigma, m, direction, k):
     """Realise one selected direction according to Algorithm 2.
 
-    Implements one exact integer grid step. In physical units this is
-    +/-epsilon; scaling the grid and moves together preserves the algorithm.
+    Implements unit steps (epsilon = 1).
+    General epsilon-perturbations are not yet implemented.
 
     m is the current arrival rank, not an original vertex index.
     Return (new_t, new_sigma, move_type), without modifying inputs.
@@ -455,8 +382,8 @@ def realise_filtration_direction(t, sigma, m, direction, k):
 def select_filtration_direction(t, sigma, phi, gamma, k):
     """Select the best positive provisional direction, Algorithm 1.
 
-    Uses integer row indices for one graph/view. Physical thresholds and
-    moves share epsilon, so the original provisional scoring is unchanged.
+    Implements unit steps (epsilon = 1) for one graph and one view.
+    General epsilon-perturbations are not yet implemented.
     phi and gamma have shape [k, z]; gamma is the NEGATIVE loss gradient.
     Moment columns for selected dimensions may be concatenated.
 
@@ -1296,14 +1223,13 @@ def prepare_filtration_teacher(
     moment_method="exact",
     n_samples=10000,
     seed=0,
-    batch_size=4096, epsilon=1.0,
+    batch_size=4096,
 ):
     """Prepare one graph/view before classification backward.
 
     phi concatenates the selected q blocks along the moment columns.
     This helper creates no autograd connection to the scores.
     """
-    epsilon = validate_filtration_epsilon(epsilon)
     q_values = tuple(q_values)
     t, sigma = decode_filtration_scores(
         scores, k, mode=decoder_mode, tau=tau
@@ -1330,7 +1256,7 @@ def prepare_filtration_teacher(
         [matrices[q] for q in q_values], dim=1
     ).to(scores.device)
 
-    return _with_filtration_grid({
+    return {
         "t": t,
         "sigma": sigma,
         "k": k,
@@ -1338,7 +1264,7 @@ def prepare_filtration_teacher(
         "z_max": z_max,
         "phi": phi,
         "moment_method": moment_method,
-    }, epsilon)
+    }
 
 
 @torch.no_grad()
@@ -1375,16 +1301,11 @@ def single_step_filtration_teacher(context, gamma):
             )
         )
 
-    epsilon = validate_filtration_epsilon(context.get("epsilon", 1.0))
-    displacement = target_t.long() - t.long()
     return {
         "selected": selected,
         "target_t": target_t,
         "target_sigma": target_sigma,
-        "displacement": displacement,
-        "epsilon": epsilon,
-        "target_filtration_values": filtration_values_from_levels(target_t, epsilon),
-        "filtration_value_displacement": displacement.to(torch.float64) * epsilon,
+        "displacement": target_t.long() - t.long(),
         "move_type": move_type,
     }
 
@@ -1589,7 +1510,6 @@ class QiHOTOGL(nn.Module):
         m1_boundary_lambda=0.5, m4_scale=1.0,
         scorer_activation="leaky_relu",
         projector_activation="leaky_relu",
-        epsilon=1.0,
     ):
         super().__init__()
 
@@ -1645,7 +1565,6 @@ class QiHOTOGL(nn.Module):
         self.n_features = n_features
         self.n_filtrations = n_filtrations
         self.k = k
-        self.epsilon = validate_filtration_epsilon(epsilon)
         self.q_values = q_values
         self.z_max = z_max
         self.decoder_mode = decoder_mode
@@ -1797,7 +1716,6 @@ class QiHOTOGL(nn.Module):
                         n_samples=self.n_samples,
                         seed=self.seed,
                         batch_size=self.walk_batch_size,
-                        epsilon=self.epsilon,
                     )
                 else:
                     context = prepare_filtration_teacher(
@@ -1813,7 +1731,6 @@ class QiHOTOGL(nn.Module):
                         seed=self.seed
                         + graph_id * self.n_filtrations + view,
                         batch_size=self.walk_batch_size,
-                        epsilon=self.epsilon,
                     )
 
                 context["fixed_random_control"] = (
@@ -1974,7 +1891,7 @@ class QiHOTOGL(nn.Module):
 class TopoGCN(torch.nn.Module):
     """Small GCN with an explicit QiHOTOGL training interface."""
 
-    def __init__(self, backward_mode="M3", *, epsilon=1.0):
+    def __init__(self, backward_mode="M3"):
         super().__init__()
         self.backbone = GCNConv(1, 4)
         self.topology = QiHOTOGL(
@@ -1982,7 +1899,6 @@ class TopoGCN(torch.nn.Module):
             k=8, q_values=(0, 1), z_max=3,
             moment_method="exact",
             backward_mode=backward_mode,
-            epsilon=epsilon,
         )
         self.classifier = nn.Linear(4, 2)
 
@@ -1992,7 +1908,7 @@ class TopoGCN(torch.nn.Module):
         return self.classifier(global_mean_pool(h, data.batch))
 
 
-def run_training_demo(model_seed=42, dataset_seed=1729, epochs=15, *, epsilon=1.0):
+def run_training_demo(model_seed=42, dataset_seed=1729, epochs=15):
     """Compare surrogate modes on six-node synthetic graphs."""
     import csv
     import json
@@ -2033,7 +1949,6 @@ def run_training_demo(model_seed=42, dataset_seed=1729, epochs=15, *, epsilon=1.
     directory.mkdir(parents=True, exist_ok=False)
 
     config = {
-        "epsilon": validate_filtration_epsilon(epsilon),
         "dataset_seed": dataset_seed,
         "model_seed": model_seed,
         "epochs": epochs,
@@ -2074,7 +1989,7 @@ def run_training_demo(model_seed=42, dataset_seed=1729, epochs=15, *, epsilon=1.
         for mode in ("no_surrogate", "M2", "M3"):
             # Identical model initialization in every arm.
             torch.manual_seed(model_seed)
-            model = TopoGCN("M3" if mode == "no_surrogate" else mode, epsilon=epsilon)
+            model = TopoGCN("M3" if mode == "no_surrogate" else mode)
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
             previous = None
             initial_scorer = [
@@ -2157,8 +2072,6 @@ def run_training_demo(model_seed=42, dataset_seed=1729, epochs=15, *, epsilon=1.
                     "epoch": epoch,
                     "timing": "training forward before optimizer update",
                     "t": current.tolist(),
-                    "epsilon": model.topology.epsilon,
-                    "filtration_values": (current.double() * model.topology.epsilon).tolist(),
                     "selected": [event["selected"] for event in events],
                 }) + "\n")
                 handle.flush()
