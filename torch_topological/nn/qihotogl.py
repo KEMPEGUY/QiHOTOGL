@@ -1967,7 +1967,7 @@ class TopoGCN(torch.nn.Module):
         return self.classifier(global_mean_pool(h, data.batch))
 
 
-def run_training_demo(model_seed=42, dataset_seed=1729, epochs=15):
+def run_training_demo(model_seed=42, dataset_seed=1729, epochs=15, modes=("no_surrogate", "M2", "M3")):
     """Compare surrogate modes on six-node synthetic graphs."""
     import csv
     import json
@@ -2045,7 +2045,7 @@ def run_training_demo(model_seed=42, dataset_seed=1729, epochs=15):
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
 
-        for mode in ("no_surrogate", "M2", "M3"):
+        for mode in modes:
             # Identical model initialization in every arm.
             torch.manual_seed(model_seed)
             model = TopoGCN("M3" if mode == "no_surrogate" else mode)
