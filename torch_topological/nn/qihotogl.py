@@ -1133,7 +1133,7 @@ def monte_carlo_hodge_moment_matrices(
 
 @torch.no_grad()
 def decode_filtration_scores(
-    scores, k, mode="score_gaps", tau=1.0
+    scores, k, mode="rank", tau=1.0
 ):
     """Decode one graph/view into an anchored injective filtration.
 
@@ -1218,7 +1218,7 @@ def prepare_filtration_teacher(
     k,
     q_values,
     z_max,
-    decoder_mode="score_gaps",
+    decoder_mode="rank",
     tau=1.0,
     moment_method="exact",
     n_samples=10000,
@@ -1499,7 +1499,7 @@ class QiHOTOGL(nn.Module):
         k=128,
         q_values=(0, 1),
         z_max=4,
-        decoder_mode="score_gaps",
+        decoder_mode="rank",
         tau=1.0,
         moment_method="exact",
         backward_mode="M3",
@@ -1510,6 +1510,8 @@ class QiHOTOGL(nn.Module):
         m1_boundary_lambda=0.5, m4_scale=1.0,
         scorer_activation="leaky_relu",
         projector_activation="leaky_relu",
+        residual_and_bn=True,
+        swap_bn_order=False,
     ):
         super().__init__()
 
@@ -1609,6 +1611,11 @@ class QiHOTOGL(nn.Module):
             make_activation(projector_activation),
             nn.Linear(out_dim, n_features),
         )
+
+        # Fusion as in TOGL: x + BN(ReLU(x0)).
+        self.residual_and_bn = bool(residual_and_bn)
+        self.swap_bn_order = bool(swap_bn_order)
+        self.batch_norm = nn.BatchNorm1d(n_features) if self.residual_and_bn else None
 
         self._training_contexts = None
 
@@ -1756,7 +1763,13 @@ class QiHOTOGL(nn.Module):
 
         features = torch.stack(graph_features)
         correction = self.moment_projector(features)
-        output = x + correction[batch]
+        correction = correction[batch]
+        if self.batch_norm is not None:
+            if self.swap_bn_order:
+                correction = nn.functional.relu(self.batch_norm(correction))
+            else:
+                correction = self.batch_norm(nn.functional.relu(correction))
+        output = x + correction
 
         if collect:
             self._training_contexts = contexts
